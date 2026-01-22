@@ -6,9 +6,14 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch: # Permite ejecutarlo manualmente desde GitHub
 
+concurrency:
+  group: update-records
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Descargar código
         uses: actions/checkout@v3
@@ -28,4 +33,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         run: python updater_final.py
