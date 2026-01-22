@@ -17,7 +17,9 @@ TRADUCCION_ESTILOS = {
     "BACKSTROKE": "Espalda",
     "BREASTSTROKE": "Pecho",
     "BUTTERFLY": "Mariposa",
-    "INDIVIDUAL MEDLEY": "Combinado"
+    "INDIVIDUAL MEDLEY": "Combinado",
+    "MEDLEY": "Combinado",
+    "IM": "Combinado"
 }
 
 def clean_time_to_ms(t_str):
@@ -37,40 +39,55 @@ def clean_time_to_ms(t_str):
 
 def procesar_actualizacion():
     with sync_playwright() as p:
-        print("🌐 Iniciando navegador...")
+        print("🌐 Iniciando navegador invisible...")
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
         # URL de Récords Mundiales (Piscina 50m)
         url_wa = "https://www.worldaquatics.com/swimming/records?recordType=WR&piscina=50m"
-        page.goto(url_wa, wait_until="networkidle")
+        print(f"🚀 Navegando a {url_wa}...")
+        page.goto(url_wa, wait_until="networkidle", timeout=60000)
 
         # Aceptar Cookies
         try:
             page.get_by_role("button", name="Accept Cookies").click(timeout=5000)
+            print("🍪 Cookies aceptadas.")
+            time.sleep(2)
         except: pass
 
-        # Buscamos todos los elementos que contengan palabras clave de natación
-        palabras_clave = ["FREESTYLE", "BACKSTROKE", "BREASTSTROKE", "BUTTERFLY", "MEDLEY"]
+        # Palabras clave para rastrear todas las pruebas de la tabla
+        palabras_clave = ["FREESTYLE", "BACKSTROKE", "BREASTSTROKE", "BUTTERFLY", "MEDLEY", "IM"]
         
+        records_procesados = set() # Para evitar duplicados en la misma ejecución
+
         for clave in palabras_clave:
-            print(f"🔍 Buscando estilo: {clave}...")
+            print(f"🔍 Buscando pruebas de tipo: {clave}...")
+            # Buscamos elementos que contienen el texto de la prueba
             items = page.get_by_text(clave).all()
             
             for item in items:
                 try:
+                    # Subimos al contenedor padre para obtener toda la info de la tarjeta
                     card_text = item.locator("xpath=./..").inner_text()
                     parts = [p.strip() for p in card_text.split('\n') if p.strip()]
                     
                     if len(parts) < 4: continue
                     
-                    header = parts[0] # Ej: "MEN 100M FREESTYLE"
+                    header = parts[0] # Ej: "MEN 200M IM" o "WOMEN 100M BACKSTROKE"
+                    
+                    # Evitar procesar lo mismo varias veces
+                    if header in records_procesados: continue
+                    records_procesados.add(header)
+
+                    # Determinar Género
                     genero = "M" if "MEN" in header and "WOMEN" not in header else "W"
                     
-                    # Extraer distancia (número antes de la 'M')
-                    distancia = int(''.join(filter(str.isdigit, header.split('M')[0])))
+                    # Extraer Distancia (ej: de '400M' extrae 400)
+                    distancia_str = header.split('M')[0].split(' ')[-1]
+                    if not distancia_str.isdigit(): continue
+                    distancia = int(distancia_str)
                     
-                    # Traducir estilo
+                    # Traducir Estilo a tu formato de DB
                     estilo_db = next((v for k, v in TRADUCCION_ESTILOS.items() if k in header), None)
                     
                     if not estilo_db: continue
@@ -80,9 +97,11 @@ def procesar_actualizacion():
                     ms_web = clean_time_to_ms(tiempo_clock)
                     competencia = parts[4]
 
-                    # 3. BUSCAR EN SUPABASE coincidiendo género, distancia y estilo
+                    if ms_web is None: continue
+
+                    # 3. BUSCAR EN SUPABASE
                     res = supabase.table("records_standards")\
-                        .select("id, time_ms")\
+                        .select("id, time_ms, athlete_name")\
                         .eq("gender", genero)\
                         .eq("distance", distancia)\
                         .eq("stroke", estilo_db)\
@@ -91,8 +110,11 @@ def procesar_actualizacion():
 
                     if res.data:
                         record_db = res.data[0]
+                        # Si el tiempo de la web es menor al de la DB, actualizamos
                         if ms_web < record_db['time_ms']:
-                            print(f"🔥 ¡NUEVO RÉCORD! {header}: {atleta} ({tiempo_clock})")
+                            print(f"🔥 ¡NUEVO RÉCORD DETECTADO! {header}")
+                            print(f"   Anterior: {record_db['time_ms']}ms | Nuevo: {ms_web}ms ({tiempo_clock})")
+                            
                             supabase.table("records_standards").update({
                                 "athlete_name": atleta,
                                 "time_clock": tiempo_clock,
@@ -102,9 +124,11 @@ def procesar_actualizacion():
                                 "verified": True
                             }).eq("id", record_db['id']).execute()
                         else:
-                            print(f"✅ {header} ya está actualizado.")
-                except: continue
+                            print(f"✅ {header}: {tiempo_clock} (Al día)")
+                except Exception as e:
+                    continue
 
+        print("🏁 Proceso finalizado con éxito.")
         browser.close()
 
 if __name__ == "__main__":
