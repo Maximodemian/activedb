@@ -1,47 +1,29 @@
 import os
 import time
-import re
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from supabase import create_client
 
-# 1. CONFIGURACIÓN DE CONEXIÓN
+# 1. CONFIGURACIÓN
 load_dotenv()
-url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_KEY")
-supabase = create_client(url, key)
+supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-# 2. DICCIONARIOS DE TRADUCCIÓN (Cerebro del Bot)
-TRADUCCION_ESTILOS = {
-    "FREESTYLE": "Libre",
-    "BACKSTROKE": "Espalda",
-    "BREASTSTROKE": "Pecho",
-    "BUTTERFLY": "Mariposa",
-    "INDIVIDUAL MEDLEY": "Combinado",
-    "MEDLEY": "Combinado",
-    "IM": "Combinado"
-}
+# Credenciales de Email
+EMAIL_USER = os.environ.get("EMAIL_USER")
+EMAIL_PASS = os.environ.get("EMAIL_PASS")
 
-MAPEO_SCOPE_DB = {
-    "WR": "MUNDIAL",
-    "WJ": "MUNDIAL",
-    "OR": "OLIMPICO",
-    "PAN": "PANAMERICANO",
-    "SAM": "SUDAMERICANO",
-    "NACIONAL": "Nacional"
-}
+# Variables de auditoría
+cambios_auditoria = []
 
-MAPEO_PISCINA = {
-    "50m": "LCM",
-    "25m": "SCM"
-}
-
-# Variable global para el Reporte de Auditoría (Fase B)
-cambios_detectados = []
+# Mapeos de traducción
+TRADUCCION_ESTILOS = {"FREESTYLE": "Libre", "BACKSTROKE": "Espalda", "BREASTSTROKE": "Pecho", "BUTTERFLY": "Mariposa", "MEDLEY": "Combinado", "IM": "Combinado"}
+MAPEO_SCOPE_DB = {"WR": "MUNDIAL", "OR": "OLIMPICO", "PAN": "PANAMERICANO", "SAM": "SUDAMERICANO"}
+MAPEO_PISCINA = {"50m": "LCM", "25m": "SCM"}
 
 def clean_time_to_ms(t_str):
-    """Convierte tiempos de la web a milisegundos"""
     try:
         t_str = t_str.strip()
         if ":" in t_str:
@@ -54,8 +36,37 @@ def clean_time_to_ms(t_str):
             return (int(s) * 1000) + (int(c) * 10)
     except: return None
 
+def enviar_reporte_mail(duracion):
+    if not EMAIL_USER or not EMAIL_PASS:
+        print("⚠️ No se enviará mail: Faltan credenciales.")
+        return
+
+    msg = EmailMessage()
+    asunto = f"🏁 Reporte Scraper: {len(cambios_auditoria)} récords actualizados"
+    msg['Subject'] = asunto
+    msg['From'] = EMAIL_USER
+    msg['To'] = "vorrabermauro@gmail.com"
+
+    cuerpo = f"Hola Coach,\n\nEl motor terminó su recorrido en {duracion}s.\n\n"
+    if cambios_auditoria:
+        cuerpo += "DETALLE DE ACTUALIZACIONES:\n"
+        for c in cambios_auditoria:
+            cuerpo += f"✅ [{c['scope']}] {c['prueba']}: {c['atleta']} bajó el tiempo de {c['tiempo_anterior']} a {c['tiempo_nuevo']}\n"
+    else:
+        cuerpo += "No hubo cambios hoy. Los récords internacionales y nacionales coinciden con tu base de datos."
+    
+    cuerpo += "\n\nLos logs ya están disponibles en Supabase.\nAtentamente,\nTu Ferrari de Récords 🏎️💨"
+    msg.set_content(cuerpo)
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(EMAIL_USER, EMAIL_PASS)
+            smtp.send_message(msg)
+        print("📧 Mail enviado con éxito.")
+    except Exception as e:
+        print(f"❌ Error enviando mail: {e}")
+
 def procesar_categoria_wa(page, record_type, piscina_web):
-    """Procesa World Aquatics (Mundiales, Olimpicos, Sudam, Panam)"""
     piscina_db = MAPEO_PISCINA.get(piscina_web)
     scope_db = MAPEO_SCOPE_DB.get(record_type)
     url_wa = f"https://www.worldaquatics.com/swimming/records?recordType={record_type}&piscina={piscina_web}"
@@ -91,118 +102,50 @@ def procesar_categoria_wa(page, record_type, piscina_web):
                     atleta = parts[2]
                     tiempo_clock = parts[3]
                     ms_web = clean_time_to_ms(tiempo_clock)
-                    competencia = parts[4]
 
-                    # Consulta a Supabase
-                    res = supabase.table("records_standards")\
-                        .select("id, time_ms, time_clock")\
-                        .eq("gender", genero)\
-                        .eq("distance", distancia)\
-                        .eq("stroke", estilo_db)\
-                        .eq("record_scope", scope_db)\
-                        .eq("pool_length", piscina_db)\
-                        .execute()
+                    # Consulta Supabase
+                    res = supabase.table("records_standards").select("*")\
+                        .eq("gender", genero).eq("distance", distancia).eq("stroke", estilo_db)\
+                        .eq("record_scope", scope_db).eq("pool_length", piscina_db).execute()
 
                     if res.data:
                         for record_db in res.data:
                             if ms_web and ms_web < record_db['time_ms']:
-                                # Guardar para el reporte final
-                                cambios_detectados.append({
+                                log_data = {
                                     "scope": scope_db,
                                     "prueba": f"{genero} {distancia}m {estilo_db}",
-                                    "anterior": record_db['time_clock'],
-                                    "nuevo": tiempo_clock,
-                                    "atleta": atleta
-                                })
-                                # Actualizar DB
+                                    "atleta": atleta,
+                                    "tiempo_anterior": record_db['time_clock'],
+                                    "tiempo_nuevo": tiempo_clock
+                                }
+                                cambios_auditoria.append(log_data)
+                                
+                                # Actualizar Registro
                                 supabase.table("records_standards").update({
-                                    "athlete_name": atleta,
-                                    "time_clock": tiempo_clock,
-                                    "time_ms": ms_web,
-                                    "competition_name": competencia,
-                                    "last_updated": datetime.now().strftime("%Y-%m-%d"),
-                                    "verified": True
+                                    "athlete_name": atleta, "time_clock": tiempo_clock, "time_ms": ms_web,
+                                    "last_updated": datetime.now().strftime("%Y-%m-%d")
                                 }).eq("id", record_db['id']).execute()
+                                
+                                # Guardar Log en Supabase
+                                supabase.table("scraper_logs").insert(log_data).execute()
                 except: continue
     except Exception as e:
         print(f"⚠️ Error en {scope_db}: {e}")
 
-def procesar_cadda_centinela(page):
-    """Módulo CADDA (Fase C): Rastrea nuevos récords y marcas de referencia argentinos"""
-    print("\n🇦🇷 Iniciando rastreo en CADDA (Argentina)...")
-    url_base = "https://cadda.org.ar/records/"
-    
-    try:
-        page.goto(url_base, wait_until="networkidle", timeout=60000)
-        
-        # El bot busca enlaces a archivos PDF o páginas de récords específicos
-        links = page.locator("a").all()
-        encontrados = []
-        
-        palabras_cadda = ["RECORD", "REFERENCIA", "HISTORICO", "MMN", "MINIMA"]
-        
-        for link in links:
-            texto = (link.inner_text() or "").upper()
-            href = link.get_attribute("href") or ""
-            
-            if any(p in texto for p in palabras_cadda) and (".pdf" in href or "record" in href):
-                encontrados.append(f"{texto}: {href}")
-        
-        if encontrados:
-            print(f"📢 Se detectaron {len(encontrados)} documentos de interés en CADDA:")
-            for e in encontrados[:5]: # Mostrar los primeros 5
-                print(f"   🔗 {e}")
-        else:
-            print("✅ No se detectaron nuevos documentos de marcas en la home de CADDA.")
-            
-    except Exception as e:
-        print(f"⚠️ Error en módulo CADDA: {e}")
-
 def ejecutar_scrapper_completo():
     start_time = time.time()
-    
     with sync_playwright() as p:
-        print("🌐 Iniciando Motor Ferrari - Scraper Maestro v2.0")
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
-        # Aceptar cookies si aparecen
-        try:
-            page.goto("https://www.worldaquatics.com/swimming/records")
-            page.get_by_role("button", name="Accept Cookies").click(timeout=5000)
-        except: pass
-
-        # 1. MATRIZ INTERNACIONAL (World Aquatics)
-        tareas = [
-            ("WR", "50m"), ("WR", "25m"),
-            ("OR", "50m"),
-            ("PAN", "50m"), ("PAN", "25m"),
-            ("SAM", "50m"), ("SAM", "25m")
-        ]
+        tareas = [("WR", "50m"), ("WR", "25m"), ("OR", "50m"), ("PAN", "50m"), ("PAN", "25m"), ("SAM", "50m"), ("SAM", "25m")]
         for r_type, p_size in tareas:
             procesar_categoria_wa(page, r_type, p_size)
 
-        # 2. MÓDULO ARGENTINA (CADDA)
-        procesar_cadda_centinela(page)
-
         browser.close()
-
-    # 3. REPORTE FINAL DE AUDITORÍA (Fase B)
-    end_time = time.time()
-    duracion = round(end_time - start_time, 2)
     
-    print("\n" + "="*50)
-    print(f"📊 REPORTE DE ACTUALIZACIÓN - {datetime.now().strftime('%d/%m/%Y')}")
-    print(f"⏱️ Tiempo total: {duracion} segundos")
-    print("="*50)
-    
-    if cambios_detectados:
-        print(f"🔥 Se encontraron y actualizaron {len(cambios_detectados)} récords:")
-        for c in cambios_detectados:
-            print(f"✅ [{c['scope']}] {c['prueba']}: {c['anterior']} ➔ {c['nuevo']} ({c['atleta']})")
-    else:
-        print("🙌 Sin cambios detectados. Todos los tiempos en la DB están actualizados.")
-    print("="*50 + "\n")
+    duracion = round(time.time() - start_time, 2)
+    enviar_reporte_mail(duracion)
 
 if __name__ == "__main__":
     ejecutar_scrapper_completo()
