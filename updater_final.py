@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """MDV Records Updater (WA + CONSANAT + PanAm Aquatics)
 
-Objetivo
+ Objetivo
 - Scrapea récords desde fuentes oficiales.
 - Hace UPSERT en Supabase (records_standards):
   * actualiza tiempos si cambiaron
