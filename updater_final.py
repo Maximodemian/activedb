@@ -49,7 +49,7 @@ except ModuleNotFoundError:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v7_COLMAP")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v8_CONS_RETRY_PANAM_PLAYWRIGHT")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 RUN_DATE = datetime.now(timezone.utc).date().isoformat()
@@ -483,9 +483,26 @@ CONS_NATACION_URL = "https://consanat.com/records/136/natacion"
 
 
 def consanat_fetch() -> str:
-    r = requests.get(CONS_NATACION_URL, timeout=60)
-    r.raise_for_status()
-    return r.text
+    """Fetch robusto para CONSANAT (GitHub runners a veces reciben 403/5xx)."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    }
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(CONS_NATACION_URL, timeout=60, headers=headers)
+            print(f"🌐 CONSANAT fetch status={r.status_code} len={len(r.text)} attempt={attempt}")
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            wait_s = 3 * attempt
+            print(f"⚠️ CONSANAT fetch intento {attempt}/3 falló: {e} (reintento en {wait_s}s)")
+            time.sleep(wait_s)
+    raise last_err or RuntimeError("CONSANAT fetch failed")
 
 
 def consanat_parse(html: str) -> List[Dict[str, Any]]:
@@ -576,9 +593,34 @@ def consanat_parse(html: str) -> List[Dict[str, Any]]:
 # -------------------------- PanAm Aquatics (Panamaquatics) --------------------------
 
 def panam_fetch(url: str) -> str:
+    """Fetch simple por requests (puede devolver HTML 'vacío' si el contenido es JS)."""
     r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    print(f"🌐 PANAM fetch status={r.status_code} len={len(r.text)}")
     r.raise_for_status()
     return r.text
+
+
+def panam_fetch_rendered(url: str) -> str:
+    """Fetch renderizado con Playwright (para páginas con contenido inyectado por JS)."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=120_000)
+            # banners típicos
+            for name in ["Accept", "Aceptar", "I agree", "OK"]:
+                try:
+                    page.get_by_role("button", name=re.compile(name, re.I)).click(timeout=1500)
+                except Exception:
+                    pass
+            # esperar un poco por render JS
+            page.wait_for_timeout(3000)
+            html = page.content()
+            print(f"🌐 PANAM rendered len={len(html)}")
+            return html
+        finally:
+            browser.close()
+
 
 
 def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
@@ -870,6 +912,12 @@ def run_panam(sb: SB) -> Dict[str, int]:
     try:
         html = panam_fetch(PANAM_AQUATICS_URL)
         rows = panam_parse(html, PANAM_AQUATICS_URL)
+        if not rows:
+            print('⚠️ PANAM: 0 filas con requests; intento renderizado Playwright…')
+            html2 = panam_fetch_rendered(PANAM_AQUATICS_URL)
+            rows = panam_parse(html2, PANAM_AQUATICS_URL)
+        if not rows:
+            raise RuntimeError('PANAM: 0 filas parseadas (probable contenido embebido/PDF/JS)')
 
         for r in rows:
             stats["seen"] += 1
