@@ -23,28 +23,26 @@ TRADUCCION_ESTILOS = {
 }
 
 def clean_time_to_ms(t_str):
-    """Convierte formatos '46.40', '01:42.00' o '14:30.67' a milisegundos"""
     try:
         t_str = t_str.strip()
         if ":" in t_str:
             parts = t_str.split(":")
-            if len(parts) == 2: # MM:SS.cc
+            if len(parts) == 2:
                 m, rest = parts
                 s, c = rest.split(".")
                 return (int(m) * 60000) + (int(s) * 1000) + (int(c) * 10)
-        else: # SS.cc
+        else:
             s, c = t_str.split(".")
             return (int(s) * 1000) + (int(c) * 10)
     except: return None
 
 def procesar_categoria(page, record_type, piscina):
-    """Ejecuta el scrapeo para una combinación específica de URL"""
     url_wa = f"https://www.worldaquatics.com/swimming/records?recordType={record_type}&piscina={piscina}"
     print(f"\n🚀 Navegando a: {record_type} | Piscina: {piscina}")
     
     try:
         page.goto(url_wa, wait_until="networkidle", timeout=60000)
-        page.mouse.wheel(0, 1500) # Scroll para disparar carga perezosa
+        page.mouse.wheel(0, 1500)
         time.sleep(3)
 
         palabras_clave = ["FREESTYLE", "BACKSTROKE", "BREASTSTROKE", "BUTTERFLY", "MEDLEY", "IM"]
@@ -56,18 +54,15 @@ def procesar_categoria(page, record_type, piscina):
                 try:
                     card_text = item.locator("xpath=./..").inner_text()
                     parts = [p.strip() for p in card_text.split('\n') if p.strip()]
-                    
                     if len(parts) < 4: continue
                     
                     header = parts[0]
                     if header in records_procesados: continue
                     records_procesados.add(header)
 
-                    # Lógica de Género y Distancia
                     genero = "M" if "MEN" in header and "WOMEN" not in header else "W"
                     distancia_parts = header.split('M')[0].split(' ')
                     distancia = int(distancia_parts[-1]) if distancia_parts[-1].isdigit() else None
-                    
                     if not distancia: continue
 
                     estilo_db = next((v for k, v in TRADUCCION_ESTILOS.items() if k in header), None)
@@ -78,8 +73,7 @@ def procesar_categoria(page, record_type, piscina):
                     ms_web = clean_time_to_ms(tiempo_clock)
                     competencia = parts[4]
 
-                    # 3. CONSULTA DINÁMICA A SUPABASE
-                    # Ajusta los nombres de columnas ('record_scope' y 'pool_length') si son distintos en tu tabla
+                    # CONSULTA A SUPABASE
                     res = supabase.table("records_standards")\
                         .select("id, time_ms")\
                         .eq("gender", genero)\
@@ -92,7 +86,7 @@ def procesar_categoria(page, record_type, piscina):
                     if res.data:
                         record_db = res.data[0]
                         if ms_web and ms_web < record_db['time_ms']:
-                            print(f"🔥 ¡NUEVO RÉCORD! {header} ({record_type}-{piscina}): {tiempo_clock}")
+                            print(f"🔥 ACTUALIZANDO {record_type} {piscina}: {header} -> {tiempo_clock}")
                             supabase.table("records_standards").update({
                                 "athlete_name": atleta,
                                 "time_clock": tiempo_clock,
@@ -101,33 +95,29 @@ def procesar_categoria(page, record_type, piscina):
                                 "last_updated": datetime.now().strftime("%Y-%m-%d")
                             }).eq("id", record_db['id']).execute()
                         else:
-                            print(f"✅ {header} ({piscina}) OK.")
+                            print(f"✅ {header} ({record_type}-{piscina}) OK.")
                 except: continue
     except Exception as e:
-        print(f"⚠️ Error en categoría {record_type}-{piscina}: {e}")
+        print(f"⚠️ Error en {record_type}-{piscina}: {e}")
 
 def ejecutar_limpieza_total():
     with sync_playwright() as p:
-        print("🌐 Iniciando motor de actualización masiva...")
+        print("🌐 Iniciando motor de actualización total...")
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
-        # Aceptar cookies una vez al inicio
-        try:
-            page.goto("https://www.worldaquatics.com/swimming/records")
-            page.get_by_role("button", name="Accept Cookies").click(timeout=5000)
-        except: pass
+        # MATRIZ DE CONFIGURACIONES
+        configuraciones = [
+            ("WR", "50m"), ("WR", "25m"),
+            ("WJ", "50m"), ("WJ", "25m"),
+            ("OR", "50m")  # Récords Olímpicos solo en 50m
+        ]
 
-        # MATRIZ DE BÚSQUEDA: Combina todos los tipos con todas las piscinas
-        tipos_record = ["WR", "WJ"]
-        tipos_piscina = ["50m", "25m"]
-
-        for r_type in tipos_record:
-            for p_size in tipos_piscina:
-                procesar_categoria(page, r_type, p_size)
+        for r_type, p_size in configuraciones:
+            procesar_categoria(page, r_type, p_size)
 
         browser.close()
-        print("\n🏁 ¡Base de datos totalmente sincronizada!")
+        print("\n🏁 ¡Sincronización completa de toda la tabla!")
 
 if __name__ == "__main__":
     ejecutar_limpieza_total()
