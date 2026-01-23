@@ -49,7 +49,7 @@ except ModuleNotFoundError:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v8_CONS_RETRY_PANAM_PLAYWRIGHT")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v9_CONS_PW_PANAM_TOL")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 RUN_DATE = datetime.now(timezone.utc).date().isoformat()
@@ -146,6 +146,20 @@ def parse_date(raw: Any) -> Optional[str]:
     if raw is None:
         return None
 
+TIME_CANDIDATE_RE = re.compile(
+    r"(?<!/)(?P<t>\d{1,2}:\d{2}\.\d{2}|\d{1,2}:\d{2}:\d{2}\.\d{2}|\d{1,2}\.\d{2}\.\d{2}|\d{1,2}\.\d{2})(?!/)"
+)
+
+def extract_time_from_text(s: str) -> Optional[str]:
+    """Devuelve un string de tiempo plausible encontrado en `s`, o None."""
+    if not s:
+        return None
+    m = TIME_CANDIDATE_RE.search(s.replace(",", "."))
+    if not m:
+        return None
+    return m.group("t")
+
+
     # openpyxl puede devolver date/datetime
     if isinstance(raw, datetime):
         return raw.date().isoformat()
@@ -190,8 +204,19 @@ def split_city(location: str) -> str:
 
 # -------------------------- Helpers: event parsing --------------------------
 
+# Acepta:
+# - "50m Freestyle", "50 Freestyle", "50 Free", "50 FR"
+# - "100m Backstroke", "100 Back", "100 BK"
+# - "200m Individual Medley", "200 IM", "200 Medley"
+# - Español: "50m Libre", "100 Espalda", etc.
 EVENT_RE = re.compile(
-    r"(?P<dist>\d{2,4})\s*m\s*(?P<stroke>freestyle|backstroke|breaststroke|butterfly|medley|libre|espalda|pecho|mariposa|combinado|im)",
+    r"(?P<dist>\d{2,4})\s*(?:m|metros|meter|metres)?\s*(?P<stroke>"
+    r"freestyle|free|fr|libre|"
+    r"backstroke|back|bk|espalda|"
+    r"breaststroke|breast|br|pecho|"
+    r"butterfly|fly|fl|mariposa|"
+    r"(?:individual\s+)?medley|im|combinado"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -201,13 +226,36 @@ def parse_event(event_raw: str) -> Tuple[Optional[int], Optional[str]]:
     if not event_raw:
         return None, None
     s = str(event_raw).strip().lower()
-    s = s.replace("individual medley", "medley")
+
+    # Normaliza sinónimos
+    s = s.replace("individual medley", "medley").replace("i.m.", "im")
+
     m = EVENT_RE.search(s)
     if not m:
         return None, None
+
     dist = int(m.group("dist"))
     stroke_key = m.group("stroke").lower()
-    stroke = STROKE_MAP.get(stroke_key)
+
+    # Normalización de stroke (abreviaturas -> clave "canónica")
+    alias = {
+        "free": "freestyle",
+        "fr": "freestyle",
+        "bk": "backstroke",
+        "back": "backstroke",
+        "br": "breaststroke",
+        "breast": "breaststroke",
+        "fl": "butterfly",
+        "fly": "butterfly",
+        "im": "medley",
+        "medley": "medley",
+    }
+    stroke_key = alias.get(stroke_key, stroke_key)
+
+    stroke = STROKE_MAP.get(stroke_key, STROKE_MAP.get(stroke_key.replace("stroke", ""), None))
+    if not stroke:
+        # últimos casos
+        stroke = STROKE_MAP.get(stroke_key)
     return dist, stroke
 
 
@@ -483,7 +531,14 @@ CONS_NATACION_URL = "https://consanat.com/records/136/natacion"
 
 
 def consanat_fetch() -> str:
-    """Fetch robusto para CONSANAT (GitHub runners a veces reciben 403/5xx)."""
+    """Fetch robusto para CONSANAT.
+
+    Problema real observado en GitHub Actions:
+    - a veces `requests` se queda en ConnectTimeout.
+    Solución:
+    - 3 reintentos con requests
+    - fallback: Playwright renderizado (mismo runner, pero diferente stack de red)
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
         "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
@@ -502,6 +557,25 @@ def consanat_fetch() -> str:
             wait_s = 3 * attempt
             print(f"⚠️ CONSANAT fetch intento {attempt}/3 falló: {e} (reintento en {wait_s}s)")
             time.sleep(wait_s)
+
+    # Fallback Playwright
+    try:
+        print("🌐 CONSANAT: intento renderizado Playwright…")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.goto(CONS_NATACION_URL, wait_until="networkidle", timeout=120_000)
+                page.wait_for_timeout(1500)
+                html = page.content()
+                print(f"🌐 CONSANAT rendered len={len(html)}")
+                if html and len(html) > 1000:
+                    return html
+            finally:
+                browser.close()
+    except Exception as e:
+        last_err = e
+
     raise last_err or RuntimeError("CONSANAT fetch failed")
 
 
@@ -624,10 +698,18 @@ def panam_fetch_rendered(url: str) -> str:
 
 
 def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
+    """Parser más tolerante para customPage (JS).
+
+    Estrategias:
+    1) Si hay <table>, parsea por columnas.
+    2) Fallback texto: busca (evento + tiempo) en la misma línea o en las 3 siguientes.
+       Esto captura layouts tipo "50 Free 20.91 César CIELO" sin <table>.
+    """
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict[str, Any]] = []
 
     tables = soup.find_all("table")
+    print(f"🔎 PANAM parse: tables={len(tables)} html_len={len(html)}")
     if tables:
         for t in tables:
             ctx = ""
@@ -635,8 +717,8 @@ def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
             if prev:
                 ctx = prev.get_text(" ", strip=True).lower()
 
-            gender = "M" if ("men" in ctx or "masc" in ctx) else ("F" if ("women" in ctx or "fem" in ctx) else "")
-            pool = "LCM" if ("50" in ctx or "lcm" in ctx or "long" in ctx) else ("SCM" if ("25" in ctx or "scm" in ctx or "short" in ctx) else "")
+            gender = "M" if ("men" in ctx or "masc" in ctx or "male" in ctx) else ("F" if ("women" in ctx or "fem" in ctx or "female" in ctx) else "")
+            pool = "LCM" if ("50" in ctx or "lcm" in ctx or "long" in ctx) else ("SCM" if ("25" in ctx or "scm" in ctx or "short" in ctx) else "LCM")
 
             rows = t.find_all("tr")
             if not rows:
@@ -657,11 +739,11 @@ def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
             c_country = col_idx(["country", "nation", "país", "pais"])
             c_date = col_idx(["date", "fecha"])
             c_comp = col_idx(["competition", "meet", "competición", "competicion"])
-            c_loc = col_idx(["location", "place", "local", "venue"])
+            c_loc = col_idx(["location", "place", "local", "venue", "city"])
 
             for r in rows[1:]:
                 cells = [c.get_text(" ", strip=True) for c in r.find_all(["th", "td"])]
-                if len(cells) < 3:
+                if len(cells) < 2:
                     continue
                 event = cells[c_event] if c_event < len(cells) else ""
                 t_raw = cells[c_time] if c_time < len(cells) else ""
@@ -678,7 +760,7 @@ def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
 
                 out.append(
                     {
-                        "pool": pool or "LCM",
+                        "pool": pool,
                         "gender": gender or "M",
                         "distance": dist,
                         "stroke": stroke,
@@ -693,6 +775,71 @@ def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
                     }
                 )
         return out
+
+    # Fallback texto plano (sin <table>)
+    text = soup.get_text("\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    gender = "M"
+    pool = "LCM"
+
+    # Debug: muestra algunas líneas clave cuando no hay tablas
+    sample_hits = 0
+    for ln in lines[:400]:
+        if any(k in ln.lower() for k in ["free", "freestyle", "libre", "back", "espalda", "butterfly", "mariposa", "breast", "pecho", "im", "medley"]):
+            sample_hits += 1
+            if sample_hits <= 5:
+                print(f"🧩 PANAM sample line: {ln[:160]}")
+
+    for idx, ln in enumerate(lines):
+        lo = ln.lower()
+        if any(k in lo for k in ["women", "femen", "fem", "damas"]):
+            gender = "F"
+        if any(k in lo for k in ["men", "masc", "varones", "hombres"]):
+            gender = "M"
+        if "25" in lo and ("pool" in lo or "scm" in lo or "short" in lo):
+            pool = "SCM"
+        if "50" in lo and ("pool" in lo or "lcm" in lo or "long" in lo):
+            pool = "LCM"
+
+        dist, stroke = parse_event(ln)
+        if not dist or not stroke:
+            continue
+
+        # 1) Tiempo en la misma línea
+        t_raw = extract_time_from_text(ln)
+        # 2) Si no está, buscar en las próximas 3 líneas
+        if not t_raw:
+            for j in (1, 2, 3):
+                if idx + j < len(lines):
+                    cand = extract_time_from_text(lines[idx + j])
+                    if cand:
+                        t_raw = cand
+                        break
+
+        if not t_raw:
+            continue
+        ms = parse_time_to_ms(t_raw)
+        if ms is None:
+            continue
+
+        out.append(
+            {
+                "pool": pool,
+                "gender": gender,
+                "distance": dist,
+                "stroke": stroke,
+                "time_ms": ms,
+                "athlete": "",
+                "country": "",
+                "record_date": "",
+                "city": "",
+                "competition_name": "",
+                "source_url": source_url,
+                "source_name": "PanAm Aquatics",
+            }
+        )
+
+    return out
 
     # fallback texto plano
     text = soup.get_text("\n")
