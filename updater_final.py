@@ -59,9 +59,10 @@ except Exception:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM_v13_COUNTRYFIX_TYPEPROBE")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM_v14_TYPEPROBEFIX")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
+RUN_DATE = datetime.now(timezone.utc).date().isoformat()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
@@ -312,12 +313,40 @@ class SB:
             if payload.get(k) in (None, ""):
                 raise ValueError(f"payload missing {k}")
 
-        # Query existing
-        q = self.client.table("records_standards").select("*")
-        for k in key_fields:
-            q = q.eq(k, payload[k])
-        existing_resp = q.limit(1).execute()
-        existing = (existing_resp.data or [None])[0]
+        # Query existing (COALESCE(record_scope,'') + type_probe NULL≈individual)
+        base_match = {
+            'gender': payload.get('gender'),
+            'category': payload.get('category'),
+            'pool_length': payload.get('pool_length'),
+            'stroke': payload.get('stroke'),
+            'distance': payload.get('distance'),
+            'record_type': payload.get('record_type'),
+        }
+        cands = (
+            self.client.table('records_standards')
+            .select('*')
+            .match(base_match)
+            .limit(20)
+            .execute()
+            .data
+        ) or []
+        want_scope = (payload.get('record_scope') or '').strip()
+        want_type = (payload.get('type_probe') or 'individual').strip() if self.has('type_probe') else None
+        existing = None
+        for r in cands:
+            r_scope = (r.get('record_scope') or '').strip()
+            if r_scope != want_scope:
+                continue
+            if self.has('type_probe'):
+                r_type = (r.get('type_probe') or 'individual').strip()
+                if want_type == 'individual':
+                    if r_type not in ('', 'individual'):
+                        continue
+                else:
+                    if r_type != want_type:
+                        continue
+            existing = r
+            break
 
         new_ms = payload.get("time_ms")
         if new_ms is None:
@@ -329,7 +358,7 @@ class SB:
         # INSERT
         if not existing:
             insert_payload = dict(payload)
-            insert_payload["last_updated"] = RUN_TS
+            insert_payload["last_updated"] = RUN_DATE
             resp = self.client.table("records_standards").insert(insert_payload).execute()
             row = (resp.data or [None])[0]
             return "inserted", row
@@ -373,7 +402,7 @@ class SB:
                 updates[f] = newv
 
         if updates:
-            updates["last_updated"] = RUN_TS
+            updates["last_updated"] = RUN_DATE
             resp = self.client.table("records_standards").update(updates).eq("id", existing["id"]).execute()
             row = (resp.data or [None])[0]
             if time_changed:
@@ -433,6 +462,7 @@ def build_payload(
         "stroke": stroke,
         "time_ms": int(time_ms),
         "time_clock": format_ms_to_clock(int(time_ms)),
+        "time_clock_2dp": time_str if time_str else None,
         "athlete_name": athlete or "",
         "country": (athlete_country or "").strip(),   # <- clave: PAÍS del atleta
         "record_date": (record_date or "").strip(),
@@ -442,6 +472,7 @@ def build_payload(
         "source_url": source_url or "",
         "source_note": source_note or "",
         "type_probe": type_probe or "individual",
+        "last_updated": RUN_DATE,
     }
     return p
 
@@ -516,8 +547,10 @@ def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
                         header_map["time"] = j
                     elif "athlete" in c or "swimmer" in c or "record holder" in c:
                         header_map["athlete"] = j
-                    elif "country" in c or "nation" in c:
+                    elif ("noc" in c) or ("nationality" in c) or ("nation" in c) or (("country" in c) and ("location" not in c) and ("venue" not in c) and ("place" not in c) and ("meet" not in c)):
                         header_map["athlete_country"] = j
+                    elif ("country" in c) and (("location" in c) or ("venue" in c) or ("place" in c)):
+                        header_map["location_country"] = j
                     elif "date" in c:
                         header_map["date"] = j
                     elif "place" in c or "location" in c or "venue" in c:
@@ -536,8 +569,26 @@ def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
                 continue
             athlete = norm(row[header_map.get("athlete", -1)]) if "athlete" in header_map else ""
             athlete_country = norm(row[header_map.get("athlete_country", -1)]) if "athlete_country" in header_map else ""
+            location_country = norm(row[header_map.get("location_country", -1)]) if "location_country" in header_map else ""
+            # Heurística: si no hay país del atleta, intentar extraer NOC de "(USA)" en el nombre
+            if not athlete_country and athlete:
+                m = re.search(r"\((?P<noc>[A-Z]{2,3})\)", athlete)
+                if m:
+                    athlete_country = m.group("noc")
+            # Si athlete_country parece ser el país de la sede (coincide con la cola de "City, Country"), moverlo a location_country cuando esté vacío
+            if athlete_country and location and ("," in location):
+                tail = location.split(",")[-1].strip()
+                if tail and athlete_country.strip().lower() == tail.lower() and not location_country:
+                    location_country = athlete_country
+                    # volver a intentar NOC en athlete; si no, dejamos athlete_country tal cual
+                    m = re.search(r"\((?P<noc>[A-Z]{2,3})\)", athlete)
+                    if m:
+                        athlete_country = m.group("noc")
             date = norm(row[header_map.get("date", -1)]) if "date" in header_map else ""
             location = norm(row[header_map.get("location", -1)]) if "location" in header_map else ""
+            # Si no hay location pero sí location_country, al menos guardamos el país como location
+            if not location and location_country:
+                location = location_country
             competition = norm(row[header_map.get("competition", -1)]) if "competition" in header_map else ""
 
             rows_out.append(
