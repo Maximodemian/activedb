@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  update:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Checkout main
+      - name: Descargar código (FORZAR main)
         uses: actions/checkout@v4
         with:
           ref: main
@@ -32,38 +32,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Instalar Chromium Playwright (si aplica)
+        run: |
           python -m playwright install --with-deps chromium
 
-      - name: Sanity check secrets (sin exponer valores)
+      - name: Run updater
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          # Dejá ambos: el .py puede usar SUPABASE_SERVICE_ROLE_KEY o SUPABASE_KEY
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python - <<'PY'
-          import os, sys
-          def chk(k):
-            v = os.getenv(k, "")
-            print(f"{k}: {'OK' if v else 'MISSING'} (len={len(v)})")
-            return bool(v)
-          has_url = chk("SUPABASE_URL")
-          has_key = chk("SUPABASE_SERVICE_ROLE_KEY") or chk("SUPABASE_KEY")
-          sys.exit(0 if (has_url and has_key) else 1)
-          PY
-
-      - name: Run updater_final.py
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          # Preferido (service_role):
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # Fallback si vos lo guardaste con este nombre:
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-
-          # Opcionales:
-          MDV_UPDATER_VERSION: WA+SUDAM+PANAM_v16
-          # PANAM_AQUATICS_URL: ${{ secrets.PANAM_AQUATICS_URL }}
+          MDV_UPDATER_VERSION: WA+SUDAM+PANAM_MAIN
         run: |
           python -u updater_final.py
