@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MDV Records Updater (WA + CONSANAT + PanAm Aquatics) — v7 (column mapping fixed)
+"""MDV Records Updater (World Aquatics + Sudamérica + PanAm Games)
 
-Qué corrige esta versión (respecto a tu updater actual):
-- Deja de escribir columnas inexistentes en `records_standards`:
-  * `record_time`            -> usa `time_clock`, `time_clock_2dp`, `time_ms`
-  * `competition_location`   -> usa `city`
-  * `notes`                  -> usa `source_note`
-- Compara y actualiza por `time_ms` (numérico), y sincroniza `time_clock` y `time_clock_2dp`.
-- Mantiene el comportamiento “fill”: completa campos vacíos aunque el tiempo no cambie.
+Qué hace
+- World Aquatics (oficial): baja XLSX desde la web y hace UPSERT en Supabase.
+- Sudamérica:
+  1) Intenta CONSANAT (oficial) (HTML). Si falla por timeout/bloqueo, hace fallback a Wikipedia ES.
+- Panamericano (récords de Juegos Panamericanos, NO "Continental Americas"):
+  - Scrapea Wikipedia EN (Pan American Games records in swimming) (LCM).
+- UPSERT en Supabase (records_standards):
+  * actualiza tiempos si cambiaron
+  * inserta récords faltantes
+  * completa campos incompletos aunque el tiempo no cambie
+- Registra un log editable en scraper_logs.
+- Envía email resumen (opcional).
 
-Requiere env:
+ENV requeridas:
 - SUPABASE_URL
-- SUPABASE_KEY  (service_role o key con permisos de escritura)
+- SUPABASE_KEY (service_role o key con permisos de escritura)
 
-Opcional:
-- EMAIL_USER / EMAIL_PASS (email resumen)
-- PANAM_AQUATICS_URL
+Opcionales:
+- EMAIL_USER / EMAIL_PASS
+- MDV_UPDATER_VERSION (default: WA+CONS+PANAM_v10_WIKI_FALLBACK)
 """
 
 from __future__ import annotations
@@ -26,10 +31,12 @@ import re
 import sys
 import json
 import uuid
+import time
 import shutil
 import smtplib
+import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -39,20 +46,18 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 from supabase import create_client
 
-# (Opcional) .env local. En GitHub Actions no hace falta.
+# (Opcional) .env para local; en GitHub Actions no hace falta
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except ModuleNotFoundError:
     pass
 
-
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v9_CONS_PW_PANAM_TOL")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v10_WIKI_FALLBACK")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
-RUN_DATE = datetime.now(timezone.utc).date().isoformat()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
@@ -60,22 +65,31 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 EMAIL_USER = os.getenv("EMAIL_USER", "").strip()
 EMAIL_PASS = os.getenv("EMAIL_PASS", "").strip()
 
-PANAM_AQUATICS_URL = os.getenv(
-    "PANAM_AQUATICS_URL",
-    "https://www.panamaquatics.com/customPage/ed0bf338-6fab-4b35-abc0-418e0db1749e",
-).strip()
+# Fuentes
+CONS_NATACION_URL = "https://consanat.com/records/136/natacion"
+WIKI_SAM_URL = "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Sudam%C3%A9rica_de_nataci%C3%B3n"
+WIKI_PANAM_GAMES_URL = "https://en.wikipedia.org/wiki/List_of_Pan_American_Games_records_in_swimming"
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Preferimos nombres en español, compatibles con tu tabla.
 STROKE_MAP = {
     "freestyle": "Libre",
     "backstroke": "Espalda",
     "breaststroke": "Pecho",
     "butterfly": "Mariposa",
     "medley": "Combinado",
+    "individual medley": "Combinado",
+
     "libre": "Libre",
     "espalda": "Espalda",
     "pecho": "Pecho",
     "mariposa": "Mariposa",
     "combinado": "Combinado",
+    "medley": "Combinado",
     "im": "Combinado",
 }
 
@@ -85,19 +99,24 @@ def parse_time_to_ms(raw: str) -> Optional[int]:
     """Convierte varios formatos a ms.
 
     Admite:
-    - "20.91"
-    - "1.41.32"
-    - "00:01:41.32"
-    - "1:41.32"
+    - "20.91" (seg.centésimas)
+    - "1.41.32" (min.seg.cent)
+    - "00:01:41.32" (h:m:s.cent)
+    - "1:41.32" (m:s.cent)
     """
-    if raw is None:
+    if not raw:
         return None
     s = str(raw).strip()
-    if not s:
-        return None
     s = s.replace(",", ".")
     s = re.sub(r"\s+", "", s)
 
+    if not s:
+        return None
+
+    # quitar caracteres extra típicos
+    s = re.sub(r"[^0-9\.:]", "", s)
+
+    # Formato con ':'
     if ":" in s:
         parts = s.split(":")
         try:
@@ -111,6 +130,7 @@ def parse_time_to_ms(raw: str) -> Optional[int]:
         except Exception:
             return None
 
+    # Formato con '.' (seg.cent o min.seg.cent o h.min.seg.cent)
     dot_parts = s.split(".")
     try:
         if len(dot_parts) == 2:
@@ -128,9 +148,7 @@ def parse_time_to_ms(raw: str) -> Optional[int]:
 
 
 def format_ms_to_hms(ms: int) -> str:
-    """Formato tabla: HH:MM:SS.xx"""
-    if ms is None:
-        return ""
+    """Formato estándar para tu tabla: HH:MM:SS.xx"""
     if ms < 0:
         ms = 0
     total_seconds = ms // 1000
@@ -141,47 +159,19 @@ def format_ms_to_hms(ms: int) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}.{cent:02d}"
 
 
-def parse_date(raw: Any) -> Optional[str]:
+def parse_date(raw: str) -> Optional[str]:
     """Devuelve YYYY-MM-DD si puede."""
-    if raw is None:
+    if not raw:
         return None
-
-TIME_CANDIDATE_RE = re.compile(
-    r"(?<!/)(?P<t>\d{1,2}:\d{2}\.\d{2}|\d{1,2}:\d{2}:\d{2}\.\d{2}|\d{1,2}\.\d{2}\.\d{2}|\d{1,2}\.\d{2})(?!/)"
-)
-
-def extract_time_from_text(s: str) -> Optional[str]:
-    """Devuelve un string de tiempo plausible encontrado en `s`, o None."""
-    if not s:
-        return None
-    m = TIME_CANDIDATE_RE.search(s.replace(",", "."))
-    if not m:
-        return None
-    return m.group("t")
-
-
-    # openpyxl puede devolver date/datetime
-    if isinstance(raw, datetime):
-        return raw.date().isoformat()
-    if isinstance(raw, date):
-        return raw.isoformat()
-
     s = str(raw).strip()
-    if not s:
-        return None
-
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
 
-    # "YYYY-MM-DD HH:MM:SS"
-    mdt = re.match(r"^(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}", s)
-    if mdt:
-        return mdt.group(1)
-
-    # dd/mm/yyyy
     m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$", s)
     if m:
-        d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3))
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
         if y < 100:
             y = 2000 + y
         try:
@@ -189,46 +179,32 @@ def extract_time_from_text(s: str) -> Optional[str]:
         except Exception:
             return None
 
+    # formatos tipo "August 7, 2015"
+    try:
+        from dateutil import parser as dateparser  # type: ignore
+        dt = dateparser.parse(s, dayfirst=False, fuzzy=True)
+        if dt:
+            return dt.date().isoformat()
+    except Exception:
+        pass
+
     return None
-
-
-def split_city(location: str) -> str:
-    """Heurística: 'Doha, Qatar' -> 'Doha'."""
-    if not location:
-        return ""
-    s = str(location).strip()
-    if "," in s:
-        return s.split(",", 1)[0].strip()
-    return s
 
 
 # -------------------------- Helpers: event parsing --------------------------
 
-# Acepta:
-# - "50m Freestyle", "50 Freestyle", "50 Free", "50 FR"
-# - "100m Backstroke", "100 Back", "100 BK"
-# - "200m Individual Medley", "200 IM", "200 Medley"
-# - Español: "50m Libre", "100 Espalda", etc.
+# Soporta EN y ES básicos. (No relays todavía)
 EVENT_RE = re.compile(
-    r"(?P<dist>\d{2,4})\s*(?:m|metros|meter|metres)?\s*(?P<stroke>"
-    r"freestyle|free|fr|libre|"
-    r"backstroke|back|bk|espalda|"
-    r"breaststroke|breast|br|pecho|"
-    r"butterfly|fly|fl|mariposa|"
-    r"(?:individual\s+)?medley|im|combinado"
-    r")\b",
+    r"(?P<dist>\d{2,4})\s*m\s*(?P<stroke>freestyle|backstroke|breaststroke|butterfly|medley|libre|espalda|pecho|mariposa|combinado|im)",
     re.IGNORECASE,
 )
 
-
 def parse_event(event_raw: str) -> Tuple[Optional[int], Optional[str]]:
-    """Devuelve (distance_m, stroke_es)."""
+    """Devuelve (distance_m, stroke_es)"""
     if not event_raw:
         return None, None
     s = str(event_raw).strip().lower()
-
-    # Normaliza sinónimos
-    s = s.replace("individual medley", "medley").replace("i.m.", "im")
+    s = s.replace("individual medley", "medley")
 
     m = EVENT_RE.search(s)
     if not m:
@@ -236,26 +212,7 @@ def parse_event(event_raw: str) -> Tuple[Optional[int], Optional[str]]:
 
     dist = int(m.group("dist"))
     stroke_key = m.group("stroke").lower()
-
-    # Normalización de stroke (abreviaturas -> clave "canónica")
-    alias = {
-        "free": "freestyle",
-        "fr": "freestyle",
-        "bk": "backstroke",
-        "back": "backstroke",
-        "br": "breaststroke",
-        "breast": "breaststroke",
-        "fl": "butterfly",
-        "fly": "butterfly",
-        "im": "medley",
-        "medley": "medley",
-    }
-    stroke_key = alias.get(stroke_key, stroke_key)
-
-    stroke = STROKE_MAP.get(stroke_key, STROKE_MAP.get(stroke_key.replace("stroke", ""), None))
-    if not stroke:
-        # últimos casos
-        stroke = STROKE_MAP.get(stroke_key)
+    stroke = STROKE_MAP.get(stroke_key)
     return dist, stroke
 
 
@@ -281,7 +238,7 @@ class SB:
         self.client = create_client(url, key)
 
     def upsert_record(self, payload: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Devuelve (status, row). status: inserted|updated|filled|unchanged"""
+        """Devuelve (status, db_row). status in: inserted|updated|filled|unchanged"""
         key_fields = [
             "record_scope",
             "record_type",
@@ -295,71 +252,51 @@ class SB:
             if payload.get(k) is None:
                 raise ValueError(f"payload missing {k}")
 
-        # Buscar row existente
         q = self.client.table("records_standards").select("*")
         for k in key_fields:
             q = q.eq(k, payload[k])
         existing_resp = q.limit(1).execute()
         existing = (existing_resp.data or [None])[0]
 
-        new_ms = payload.get("time_ms")
-        if isinstance(new_ms, str):
-            new_ms = parse_time_to_ms(new_ms)
-        if new_ms is None:
-            # sin tiempo no podemos hacer nada útil
-            return "unchanged", existing
+        new_ms = parse_time_to_ms(payload.get("record_time", ""))
 
-        # Insert si no existe
         if not existing:
             insert_payload = dict(payload)
-            insert_payload.setdefault("last_updated", RUN_DATE)
-            insert_payload.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+            insert_payload["last_updated"] = RUN_TS
             resp = self.client.table("records_standards").insert(insert_payload).execute()
             row = (resp.data or [None])[0]
             return "inserted", row
 
-        old_ms = existing.get("time_ms")
-        try:
-            old_ms_int = int(old_ms) if old_ms is not None else None
-        except Exception:
-            old_ms_int = None
+        old_ms = parse_time_to_ms(existing.get("record_time") or "")
+        time_changed = (new_ms is not None and old_ms is not None and new_ms != old_ms)
 
-        time_changed = (old_ms_int is not None and int(new_ms) != old_ms_int)
-
-        # Fill fields (solo si en DB está vacío)
+        # Campos que completamos aunque no cambie el tiempo
         fill_fields = [
             "athlete_name",
             "country",
             "record_date",
             "competition_name",
-            "city",
+            "competition_city",
+            "competition_country",
             "source_name",
             "source_url",
-            "source_note",
-            "time_clock",
-            "time_clock_2dp",
+            "notes",
         ]
-
         updates: Dict[str, Any] = {}
 
         for f in fill_fields:
             newv = payload.get(f)
             oldv = existing.get(f)
-            if newv is None or str(newv).strip() == "":
+            if newv is None or newv == "":
                 continue
             if oldv is None or str(oldv).strip() == "":
                 updates[f] = newv
 
-        # Si cambió el tiempo, sincronizamos los 3 campos de tiempo
         if time_changed:
-            updates["time_ms"] = int(new_ms)
-            updates["time_clock"] = payload.get("time_clock", format_ms_to_hms(int(new_ms)))
-            updates["time_clock_2dp"] = payload.get("time_clock_2dp", payload.get("time_clock", format_ms_to_hms(int(new_ms))))
+            updates["record_time"] = payload.get("record_time")
 
         if updates:
-            updates["last_updated"] = RUN_DATE
-            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-
+            updates["last_updated"] = RUN_TS
             resp = (
                 self.client.table("records_standards")
                 .update(updates)
@@ -371,30 +308,33 @@ class SB:
 
         return "unchanged", existing
 
-    def log(self, scope: str, prueba: str, atleta: str, t_old: str = "", t_new: str = "") -> None:
+    def log(self, scope: str, prueba: str, atleta: str, t_old: str = "", t_new: str = "", message: str = "") -> None:
+        """Inserta en scraper_logs (tolerante). No frena el run si falla."""
         base = {
-            "fecha": datetime.now(timezone.utc).isoformat(),
+            "fecha": RUN_TS,
             "scope": scope,
             "prueba": prueba,
             "atleta": atleta,
             "tiempo_anterior": t_old,
             "tiempo_nuevo": t_new,
+            "message": message,
+            "run_id": RUN_ID,
+            "version": MDV_UPDATER_VERSION,
         }
         try:
             self.client.table("scraper_logs").insert(base).execute()
         except Exception:
-            # no romper el run por logs
+            # no matamos el run por logs
             return
 
 
-# -------------------------- WA (World Aquatics) --------------------------
+# -------------------------- World Aquatics (XLSX) --------------------------
 
 @dataclass
 class WASpec:
-    code: str   # WR, OR, WJ, CR_AMERICAS
-    pool: str   # LCM/SCM
-    gender: str # M/F
-
+    code: str  # WR, OR, WJ, CR_AMERICAS
+    pool: str  # LCM/SCM
+    gender: str  # M/F
 
 def wa_url(spec: WASpec) -> str:
     base = "https://www.worldaquatics.com/swimming/records"
@@ -408,13 +348,34 @@ def wa_url(spec: WASpec) -> str:
         return f"{base}?recordType=PAN&recordCode=CR&eventTypeId=&region=AMERICAS&countryId=&gender={spec.gender}&pool={spec.pool}"
     raise ValueError(f"Unknown WA code {spec.code}")
 
+def wa_specs() -> List[WASpec]:
+    out: List[WASpec] = []
+    for gender in ("M", "F"):
+        for pool in ("LCM", "SCM"):
+            out.append(WASpec("WR", pool, gender))
+            out.append(WASpec("WJ", pool, gender))
+            out.append(WASpec("CR_AMERICAS", pool, gender))
+        out.append(WASpec("OR", "LCM", gender))
+    return out
+
+def wa_scope_and_type(code: str, pool: str) -> Tuple[str, str]:
+    pool = pool_label(pool)
+    is_scm = pool == "SCM"
+    if code == "WR":
+        return "Mundial", "Récord Mundial" + (" SC" if is_scm else "")
+    if code == "OR":
+        return "Olímpico", "Récord Olímpico"
+    if code == "WJ":
+        return "Mundial", "Récord Mundial Junior" + (" SC" if is_scm else "")
+    if code == "CR_AMERICAS":
+        return "Américas", "Récord Continental Américas" + (" SC" if is_scm else "")
+    raise ValueError(code)
 
 def wa_download_xlsx(page, url: str, out_dir: str) -> str:
     page.goto(url, wait_until="networkidle", timeout=120_000)
 
-    # cookies banner
     try:
-        page.get_by_role("button", name=re.compile(r"Accept Cookies", re.I)).click(timeout=3000)
+        page.get_by_role("button", name=re.compile(r"Accept Cookies", re.I)).click(timeout=2500)
     except Exception:
         pass
 
@@ -430,15 +391,14 @@ def wa_download_xlsx(page, url: str, out_dir: str) -> str:
     download.save_as(path)
     return path
 
-
 def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
     wb = load_workbook(xlsx_path, data_only=True)
     rows_out: List[Dict[str, Any]] = []
 
-    def norm(v: Any) -> Any:
+    def norm(v: Any) -> str:
         if v is None:
             return ""
-        return v
+        return str(v).strip()
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -449,8 +409,8 @@ def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
         header_idx = None
         header_map: Dict[str, int] = {}
 
-        for i, row in enumerate(values[:50]):
-            row_norm = [str(norm(x)).strip().lower() for x in row]
+        for i, row in enumerate(values[:60]):
+            row_norm = [norm(x).lower() for x in row]
             if any("event" in c for c in row_norm) and any("time" in c for c in row_norm):
                 header_idx = i
                 for j, c in enumerate(row_norm):
@@ -474,110 +434,40 @@ def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
             continue
 
         for row in values[header_idx + 1 :]:
-            event = str(norm(row[header_map["event"]])).strip()
-            t = str(norm(row[header_map["time"]])).strip()
+            event = norm(row[header_map["event"]])
+            t = norm(row[header_map["time"]])
             if not event or not t:
                 continue
 
-            athlete = str(norm(row[header_map.get("athlete", -1)])).strip() if "athlete" in header_map else ""
-            country = str(norm(row[header_map.get("country", -1)])).strip() if "country" in header_map else ""
-            d_raw = norm(row[header_map.get("date", -1)]) if "date" in header_map else ""
-            loc = str(norm(row[header_map.get("location", -1)])).strip() if "location" in header_map else ""
-            comp = str(norm(row[header_map.get("competition", -1)])).strip() if "competition" in header_map else ""
+            athlete = norm(row[header_map.get("athlete", -1)]) if "athlete" in header_map else ""
+            country = norm(row[header_map.get("country", -1)]) if "country" in header_map else ""
+            date = norm(row[header_map.get("date", -1)]) if "date" in header_map else ""
+            location = norm(row[header_map.get("location", -1)]) if "location" in header_map else ""
+            competition = norm(row[header_map.get("competition", -1)]) if "competition" in header_map else ""
 
             rows_out.append(
-                {
-                    "event": event,
-                    "time": t,
-                    "athlete": athlete,
-                    "country": country,
-                    "date": d_raw,
-                    "location": loc,
-                    "competition": comp,
-                }
+                {"event": event, "time": t, "athlete": athlete, "country": country, "date": date, "location": location, "competition": competition}
             )
-
     return rows_out
 
+# -------------------------- Sudamérica: CONSANAT + fallback WIKI --------------------------
 
-def wa_specs() -> List[WASpec]:
-    out: List[WASpec] = []
-    for gender in ("M", "F"):
-        for pool in ("LCM", "SCM"):
-            out.append(WASpec("WR", pool, gender))
-            out.append(WASpec("WJ", pool, gender))
-            out.append(WASpec("CR_AMERICAS", pool, gender))
-        out.append(WASpec("OR", "LCM", gender))
-    return out
-
-
-def wa_scope_and_type(code: str, pool: str) -> Tuple[str, str]:
-    pool = pool_label(pool)
-    is_scm = pool == "SCM"
-    if code == "WR":
-        return "Mundial", "Récord Mundial" + (" SC" if is_scm else "")
-    if code == "OR":
-        return "Olímpico", "Récord Olímpico"
-    if code == "WJ":
-        return "Mundial", "Récord Mundial Junior" + (" SC" if is_scm else "")
-    if code == "CR_AMERICAS":
-        return "Américas", "Récord Continental Américas" + (" SC" if is_scm else "")
-    raise ValueError(code)
-
-
-# -------------------------- CONSANAT --------------------------
-
-CONS_NATACION_URL = "https://consanat.com/records/136/natacion"
-
-
-def consanat_fetch() -> str:
-    """Fetch robusto para CONSANAT.
-
-    Problema real observado en GitHub Actions:
-    - a veces `requests` se queda en ConnectTimeout.
-    Solución:
-    - 3 reintentos con requests
-    - fallback: Playwright renderizado (mismo runner, pero diferente stack de red)
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    }
-    last_err: Exception | None = None
-    for attempt in range(1, 4):
+def fetch_with_retries(url: str, tries: int = 3, connect_timeout: int = 20, read_timeout: int = 60, tag: str = "FETCH") -> str:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, tries + 1):
         try:
-            r = requests.get(CONS_NATACION_URL, timeout=60, headers=headers)
-            print(f"🌐 CONSANAT fetch status={r.status_code} len={len(r.text)} attempt={attempt}")
+            r = requests.get(url, timeout=(connect_timeout, read_timeout), headers=DEFAULT_HEADERS)
             r.raise_for_status()
             return r.text
         except Exception as e:
             last_err = e
             wait_s = 3 * attempt
-            print(f"⚠️ CONSANAT fetch intento {attempt}/3 falló: {e} (reintento en {wait_s}s)")
+            print(f"⚠️ {tag} intento {attempt}/{tries} falló: {e} (reintento en {wait_s}s)")
             time.sleep(wait_s)
+    raise last_err or RuntimeError(f"{tag} falló sin excepción? url={url}")
 
-    # Fallback Playwright
-    try:
-        print("🌐 CONSANAT: intento renderizado Playwright…")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            try:
-                page.goto(CONS_NATACION_URL, wait_until="networkidle", timeout=120_000)
-                page.wait_for_timeout(1500)
-                html = page.content()
-                print(f"🌐 CONSANAT rendered len={len(html)}")
-                if html and len(html) > 1000:
-                    return html
-            finally:
-                browser.close()
-    except Exception as e:
-        last_err = e
-
-    raise last_err or RuntimeError("CONSANAT fetch failed")
-
+def consanat_fetch() -> str:
+    return fetch_with_retries(CONS_NATACION_URL, tries=3, connect_timeout=20, read_timeout=60, tag="CONSANAT fetch")
 
 def consanat_parse(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -591,6 +481,7 @@ def consanat_parse(html: str) -> List[Dict[str, Any]]:
         return None
 
     out: List[Dict[str, Any]] = []
+
     idx_scm = find_idx("RECORDS SUDAMERICANOS DE PISCINA CORTA")
     idx_lcm = find_idx("RECORDS SUDAMERICANOS DE PISCINA LARGA")
 
@@ -607,288 +498,203 @@ def consanat_parse(html: str) -> List[Dict[str, Any]]:
                 g_start = next(i for i, ln in enumerate(chunk) if ln.upper() == gender_word)
             except StopIteration:
                 continue
-
-            g_end = None
-            for i in range(g_start + 1, len(chunk)):
-                if chunk[i].upper() in ("FEMININO", "MASCULINO"):
-                    g_end = i
-                    break
-            if g_end is None:
-                g_end = len(chunk)
-
+            g_end = next((i for i in range(g_start + 1, len(chunk)) if chunk[i].upper() in ("FEMININO", "MASCULINO")), len(chunk))
             g_lines = chunk[g_start:g_end]
-
             try:
                 h = next(i for i, ln in enumerate(g_lines) if ln.upper() == "PRUEBAS")
             except StopIteration:
                 continue
-
             data = g_lines[h:]
             try:
                 header_end = next(i for i, ln in enumerate(data) if "COMPET" in ln.upper())
             except StopIteration:
                 continue
-
             rows = data[header_end + 1 :]
 
             for i in range(0, len(rows) - 6, 7):
-                event = rows[i]
-                t = rows[i + 1]
-                athlete = rows[i + 2]
-                country = rows[i + 3]
-                d_raw = rows[i + 4]
-                location = rows[i + 5]
-                comp = rows[i + 6]
-
+                event = rows[i]; t = rows[i + 1]; athlete = rows[i + 2]; country = rows[i + 3]; date = rows[i + 4]; location = rows[i + 5]; comp = rows[i + 6]
                 dist, stroke = parse_event(event)
                 ms = parse_time_to_ms(t)
                 if dist is None or stroke is None or ms is None:
                     continue
-
-                out.append(
-                    {
-                        "pool": pool,
-                        "gender": gender,
-                        "distance": dist,
-                        "stroke": stroke,
-                        "time_ms": ms,
-                        "athlete": athlete,
-                        "country": country,
-                        "record_date": parse_date(d_raw) or str(d_raw),
-                        "city": split_city(location),
-                        "competition_name": comp,
-                        "source_url": CONS_NATACION_URL,
-                        "source_name": "CONSANAT",
-                    }
-                )
+                out.append({
+                    "pool": pool, "gender": gender, "event": event, "distance": dist, "stroke": stroke, "time_ms": ms,
+                    "athlete": athlete, "country": country, "date": parse_date(date) or date,
+                    "city": location, "comp": comp, "source_name": "CONSANAT", "source_url": CONS_NATACION_URL
+                })
     return out
 
-
-# -------------------------- PanAm Aquatics (Panamaquatics) --------------------------
-
-def panam_fetch(url: str) -> str:
-    """Fetch simple por requests (puede devolver HTML 'vacío' si el contenido es JS)."""
-    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-    print(f"🌐 PANAM fetch status={r.status_code} len={len(r.text)}")
-    r.raise_for_status()
-    return r.text
-
-
-def panam_fetch_rendered(url: str) -> str:
-    """Fetch renderizado con Playwright (para páginas con contenido inyectado por JS)."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            page.goto(url, wait_until="networkidle", timeout=120_000)
-            # banners típicos
-            for name in ["Accept", "Aceptar", "I agree", "OK"]:
-                try:
-                    page.get_by_role("button", name=re.compile(name, re.I)).click(timeout=1500)
-                except Exception:
-                    pass
-            # esperar un poco por render JS
-            page.wait_for_timeout(3000)
-            html = page.content()
-            print(f"🌐 PANAM rendered len={len(html)}")
-            return html
-        finally:
-            browser.close()
-
-
-
-def panam_parse(html: str, source_url: str) -> List[Dict[str, Any]]:
-    """Parser más tolerante para customPage (JS).
-
-    Estrategias:
-    1) Si hay <table>, parsea por columnas.
-    2) Fallback texto: busca (evento + tiempo) en la misma línea o en las 3 siguientes.
-       Esto captura layouts tipo "50 Free 20.91 César CIELO" sin <table>.
-    """
+def wiki_sam_parse(html: str) -> List[Dict[str, Any]]:
+    """Parsea la página ES de Wikipedia (Plusmarcas Sudamérica). Muy estable para scraping."""
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict[str, Any]] = []
 
-    tables = soup.find_all("table")
-    print(f"🔎 PANAM parse: tables={len(tables)} html_len={len(html)}")
-    if tables:
-        for t in tables:
-            ctx = ""
-            prev = t.find_previous(["h1", "h2", "h3", "h4", "h5"])
-            if prev:
-                ctx = prev.get_text(" ", strip=True).lower()
-
-            gender = "M" if ("men" in ctx or "masc" in ctx or "male" in ctx) else ("F" if ("women" in ctx or "fem" in ctx or "female" in ctx) else "")
-            pool = "LCM" if ("50" in ctx or "lcm" in ctx or "long" in ctx) else ("SCM" if ("25" in ctx or "scm" in ctx or "short" in ctx) else "LCM")
-
-            rows = t.find_all("tr")
-            if not rows:
-                continue
-
-            header_cells = [c.get_text(" ", strip=True).lower() for c in rows[0].find_all(["th", "td"])]
-
-            def col_idx(keys: Iterable[str]) -> Optional[int]:
-                for k in keys:
-                    for i, c in enumerate(header_cells):
-                        if k in c:
-                            return i
-                return None
-
-            c_event = col_idx(["event", "prueba"]) or 0
-            c_time = col_idx(["time", "tiempo", "mark"]) or 1
-            c_ath = col_idx(["athlete", "swimmer", "recordist", "recordista"]) or 2
-            c_country = col_idx(["country", "nation", "país", "pais"])
-            c_date = col_idx(["date", "fecha"])
-            c_comp = col_idx(["competition", "meet", "competición", "competicion"])
-            c_loc = col_idx(["location", "place", "local", "venue", "city"])
-
-            for r in rows[1:]:
-                cells = [c.get_text(" ", strip=True) for c in r.find_all(["th", "td"])]
-                if len(cells) < 2:
-                    continue
-                event = cells[c_event] if c_event < len(cells) else ""
-                t_raw = cells[c_time] if c_time < len(cells) else ""
-                athlete = cells[c_ath] if c_ath < len(cells) else ""
-                country = cells[c_country] if (c_country is not None and c_country < len(cells)) else ""
-                d_raw = cells[c_date] if (c_date is not None and c_date < len(cells)) else ""
-                comp = cells[c_comp] if (c_comp is not None and c_comp < len(cells)) else ""
-                loc = cells[c_loc] if (c_loc is not None and c_loc < len(cells)) else ""
-
-                dist, stroke = parse_event(event)
-                ms = parse_time_to_ms(t_raw)
-                if not dist or not stroke or ms is None:
-                    continue
-
-                out.append(
-                    {
-                        "pool": pool,
-                        "gender": gender or "M",
-                        "distance": dist,
-                        "stroke": stroke,
-                        "time_ms": ms,
-                        "athlete": athlete,
-                        "country": country,
-                        "record_date": parse_date(d_raw) or str(d_raw),
-                        "city": split_city(loc),
-                        "competition_name": comp,
-                        "source_url": source_url,
-                        "source_name": "PanAm Aquatics",
-                    }
-                )
+    # En Wikipedia, las tablas suelen tener class="wikitable"
+    tables = soup.select("table.wikitable")
+    if not tables:
         return out
 
-    # Fallback texto plano (sin <table>)
-    text = soup.get_text("\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    gender = "M"
-    pool = "LCM"
-
-    # Debug: muestra algunas líneas clave cuando no hay tablas
-    sample_hits = 0
-    for ln in lines[:400]:
-        if any(k in ln.lower() for k in ["free", "freestyle", "libre", "back", "espalda", "butterfly", "mariposa", "breast", "pecho", "im", "medley"]):
-            sample_hits += 1
-            if sample_hits <= 5:
-                print(f"🧩 PANAM sample line: {ln[:160]}")
-
-    for idx, ln in enumerate(lines):
-        lo = ln.lower()
-        if any(k in lo for k in ["women", "femen", "fem", "damas"]):
-            gender = "F"
-        if any(k in lo for k in ["men", "masc", "varones", "hombres"]):
-            gender = "M"
-        if "25" in lo and ("pool" in lo or "scm" in lo or "short" in lo):
-            pool = "SCM"
-        if "50" in lo and ("pool" in lo or "lcm" in lo or "long" in lo):
+    # Heurística:
+    # - Detectar contexto (LCM/SCM y género) por el heading previo (h2/h3)
+    def detect_ctx(table) -> Tuple[str, str]:
+        pool = ""
+        gender = ""
+        # busca encabezados cercanos
+        heading = table.find_previous(["h2", "h3", "h4"])
+        ctx = heading.get_text(" ", strip=True).lower() if heading else ""
+        if "piscina larga" in ctx or "50" in ctx:
             pool = "LCM"
+        if "piscina corta" in ctx or "25" in ctx:
+            pool = "SCM"
+        if "hombres" in ctx or "mascul" in ctx:
+            gender = "M"
+        if "mujeres" in ctx or "femen" in ctx:
+            gender = "F"
+        return pool, gender
 
-        dist, stroke = parse_event(ln)
-        if not dist or not stroke:
+    for t in tables:
+        pool, gender = detect_ctx(t)
+        # header
+        header = [th.get_text(" ", strip=True).lower() for th in t.select("tr th")]
+        if not header:
             continue
 
-        # 1) Tiempo en la misma línea
-        t_raw = extract_time_from_text(ln)
-        # 2) Si no está, buscar en las próximas 3 líneas
-        if not t_raw:
-            for j in (1, 2, 3):
-                if idx + j < len(lines):
-                    cand = extract_time_from_text(lines[idx + j])
-                    if cand:
-                        t_raw = cand
-                        break
+        # buscamos columnas típicas
+        # (La estructura puede variar. Vamos robustos.)
+        rows = t.select("tr")[1:]
+        for tr in rows:
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["th","td"])]
+            if len(cells) < 3:
+                continue
 
-        if not t_raw:
-            continue
-        ms = parse_time_to_ms(t_raw)
-        if ms is None:
-            continue
+            event = cells[0]
+            # columnas comunes: Marca / Tiempo suele estar en 1
+            t_raw = cells[1]
+            athlete = cells[2] if len(cells) > 2 else ""
+            country = cells[3] if len(cells) > 3 else ""
+            date = cells[4] if len(cells) > 4 else ""
+            location = cells[5] if len(cells) > 5 else ""
+            competition = cells[6] if len(cells) > 6 else ""
 
-        out.append(
-            {
-                "pool": pool,
-                "gender": gender,
+            dist, stroke = parse_event(event)
+            ms = parse_time_to_ms(t_raw)
+
+            if dist is None or stroke is None or ms is None:
+                continue
+
+            out.append({
+                "pool": pool or "LCM",
+                "gender": gender or "M",
+                "event": event,
                 "distance": dist,
                 "stroke": stroke,
                 "time_ms": ms,
-                "athlete": "",
-                "country": "",
-                "record_date": "",
-                "city": "",
-                "competition_name": "",
-                "source_url": source_url,
-                "source_name": "PanAm Aquatics",
-            }
-        )
+                "athlete": athlete,
+                "country": country,
+                "date": parse_date(date) or date,
+                "city": location,
+                "comp": competition,
+                "source_name": "Wikipedia (Sudamérica)",
+                "source_url": WIKI_SAM_URL,
+            })
 
     return out
 
-    # fallback texto plano
-    text = soup.get_text("\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    gender = "M"
-    pool = "LCM"
+# -------------------------- PanAm Games (Wikipedia EN) --------------------------
 
-    for idx, ln in enumerate(lines):
-        lo = ln.lower()
-        if any(k in lo for k in ["women", "femen", "fem", "damas"]):
-            gender = "F"
-        if any(k in lo for k in ["men", "masc", "varones", "hombres"]):
-            gender = "M"
-        if "25" in lo and ("pool" in lo or "scm" in lo or "short" in lo):
-            pool = "SCM"
-        if "50" in lo and ("pool" in lo or "lcm" in lo or "long" in lo):
-            pool = "LCM"
+def wiki_panam_games_fetch() -> str:
+    return fetch_with_retries(WIKI_PANAM_GAMES_URL, tries=3, connect_timeout=20, read_timeout=60, tag="PANAM_GAMES(WIKI) fetch")
 
-        dist, stroke = parse_event(ln)
-        if not dist or not stroke:
+def wiki_panam_games_parse(html: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Dict[str, Any]] = []
+    tables = soup.select("table.wikitable")
+    if not tables:
+        return out
+
+    # El artículo suele tener secciones "Men" y "Women" y tablas por stroke.
+    # Detectamos género mirando el heading anterior.
+    def ctx_gender(table) -> str:
+        h = table.find_previous(["h2", "h3", "h4"])
+        ctx = h.get_text(" ", strip=True).lower() if h else ""
+        if "women" in ctx:
+            return "F"
+        if "men" in ctx:
+            return "M"
+        return "M"
+
+    for t in tables:
+        gender = ctx_gender(t)
+        rows = t.select("tr")
+        if len(rows) < 2:
             continue
-        if idx + 1 >= len(lines):
-            continue
-        t_raw = lines[idx + 1]
-        ms = parse_time_to_ms(t_raw)
-        if ms is None:
+        header_cells = [c.get_text(" ", strip=True).lower() for c in rows[0].find_all(["th","td"])]
+
+        def col_idx(keys: Iterable[str]) -> Optional[int]:
+            for k in keys:
+                for i, c in enumerate(header_cells):
+                    if k in c:
+                        return i
+            return None
+
+        c_event = col_idx(["event", "distance"])  # a veces "event"
+        c_time = col_idx(["time"])
+        c_ath = col_idx(["athlete", "swimmer"])
+        c_country = col_idx(["nation", "country", "noc"])
+        c_date = col_idx(["date"])
+        c_loc = col_idx(["venue", "location"])
+        c_comp = col_idx(["games", "competition", "event"])  # no siempre
+
+        # si no detectamos time/event, no es tabla de records
+        if c_time is None or c_event is None:
             continue
 
-        out.append(
-            {
-                "pool": pool,
+        for tr in rows[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
+            if len(cells) <= max(c_time, c_event):
+                continue
+            event = cells[c_event]
+            t_raw = cells[c_time]
+
+            dist, stroke = parse_event(event)
+            ms = parse_time_to_ms(t_raw)
+            if dist is None or stroke is None or ms is None:
+                continue
+
+            athlete = cells[c_ath] if (c_ath is not None and c_ath < len(cells)) else ""
+            country = cells[c_country] if (c_country is not None and c_country < len(cells)) else ""
+            date = cells[c_date] if (c_date is not None and c_date < len(cells)) else ""
+            loc = cells[c_loc] if (c_loc is not None and c_loc < len(cells)) else ""
+            comp = cells[c_comp] if (c_comp is not None and c_comp < len(cells)) else "Pan American Games"
+
+            out.append({
+                "pool": "LCM",  # PanAm Games records en piscina larga
                 "gender": gender,
+                "event": event,
                 "distance": dist,
                 "stroke": stroke,
                 "time_ms": ms,
-                "athlete": "",
-                "country": "",
-                "record_date": "",
-                "city": "",
-                "competition_name": "",
-                "source_url": source_url,
-                "source_name": "PanAm Aquatics",
-            }
-        )
-
+                "athlete": athlete,
+                "country": country,
+                "date": parse_date(date) or date,
+                "city": loc,
+                "comp": comp,
+                "source_name": "Wikipedia (PanAm Games)",
+                "source_url": WIKI_PANAM_GAMES_URL,
+            })
     return out
-
 
 # -------------------------- Build payloads --------------------------
+
+def split_location(loc: str) -> Tuple[str, str]:
+    """Intenta partir 'City, Country' -> (city, country)."""
+    if not loc:
+        return "", ""
+    s = str(loc).strip()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return s, ""
 
 def build_payload(
     record_scope: str,
@@ -901,13 +707,13 @@ def build_payload(
     athlete: str,
     country: str,
     record_date: str,
-    competition_name: str,
-    location: str,
+    comp_name: str,
+    comp_location: str,
     source_name: str,
     source_url: str,
 ) -> Dict[str, Any]:
-    time_ms_int = int(time_ms)
-    clock = format_ms_to_hms(time_ms_int)
+    city, comp_country = split_location(comp_location)
+    # si country del atleta viene vacío, intentamos usar el del lugar (no siempre coincide)
     return {
         "record_scope": record_scope,
         "record_type": record_type,
@@ -916,23 +722,19 @@ def build_payload(
         "gender": gender_label(gender),
         "distance": int(distance),
         "stroke": stroke,
-        "time_clock": clock,
-        "time_clock_2dp": clock,
-        "time_ms": time_ms_int,
+        "record_time": format_ms_to_hms(int(time_ms)),
         "athlete_name": athlete or "",
         "country": country or "",
         "record_date": record_date or "",
-        "competition_name": competition_name or "",
-        "city": split_city(location),
+        "competition_name": comp_name or "",
+        "competition_city": city or "",
+        "competition_country": comp_country or "",
         "source_name": source_name or "",
         "source_url": source_url or "",
-        "source_note": "",
-        "is_active": True,
-        # last_updated / updated_at los setea SB.upsert_record si faltan
+        "notes": "",
     }
 
-
-# -------------------------- Runners --------------------------
+# -------------------------- Runs --------------------------
 
 def run_wa(sb: SB) -> Dict[str, int]:
     stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
@@ -971,33 +773,28 @@ def run_wa(sb: SB) -> Dict[str, int]:
                         time_ms=ms,
                         athlete=r.get("athlete", ""),
                         country=r.get("country", ""),
-                        record_date=parse_date(r.get("date")) or str(r.get("date") or ""),
-                        competition_name=r.get("competition", ""),
-                        location=r.get("location", ""),
+                        record_date=parse_date(r.get("date", "")) or r.get("date", ""),
+                        comp_name=r.get("competition", ""),
+                        comp_location=r.get("location", ""),
                         source_name="World Aquatics",
                         source_url=url,
                     )
 
-                    status, row = sb.upsert_record(payload)
-                    prueba = f"{spec.gender} {dist}m {stroke} ({spec.pool})"
+                    status, _row = sb.upsert_record(payload)
                     if status == "inserted":
                         stats["inserted"] += 1
-                        sb.log(record_scope, prueba, payload.get("athlete_name", ""), "", payload["time_clock"])
                     elif status == "updated":
                         stats["updated"] += 1
-                        old = format_ms_to_hms(int(row.get("time_ms"))) if row and row.get("time_ms") else "(changed)"
-                        sb.log(record_scope, prueba, payload.get("athlete_name", ""), old, payload["time_clock"])
                     elif status == "filled":
                         stats["filled"] += 1
-                        sb.log(record_scope, prueba, payload.get("athlete_name", ""), "(fill)", payload["time_clock"])
                     else:
                         stats["unchanged"] += 1
 
             except Exception as e:
                 stats["errors"] += 1
-                err = f"WA {spec.code} {spec.pool} {spec.gender} error: {e}"
-                print("❌", err)
-                sb.log("ERROR", f"WA {spec.code} {spec.pool} {spec.gender}", err)
+                msg = f"WA {spec.code} {spec.pool} {spec.gender} error: {e}"
+                print("❌", msg)
+                sb.log("ERROR", f"WA {spec.code} {spec.pool} {spec.gender}", "", message=msg + "\n" + traceback.format_exc())
                 continue
 
         browser.close()
@@ -1005,109 +802,126 @@ def run_wa(sb: SB) -> Dict[str, int]:
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return stats
 
-
-def run_consanat(sb: SB) -> Dict[str, int]:
+def run_sudamerica(sb: SB) -> Dict[str, int]:
     stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
+
+    rows: List[Dict[str, Any]] = []
+    source_used = ""
+
+    # 1) CONSANAT
     try:
         html = consanat_fetch()
         rows = consanat_parse(html)
-        for r in rows:
-            stats["seen"] += 1
-            record_scope = "Sudamericano"
-            record_type = "Récord Sudamericano" + (" SC" if r["pool"] == "SCM" else "")
-
-            payload = build_payload(
-                record_scope=record_scope,
-                record_type=record_type,
-                pool=r["pool"],
-                gender=r["gender"],
-                distance=r["distance"],
-                stroke=r["stroke"],
-                time_ms=r["time_ms"],
-                athlete=r.get("athlete", ""),
-                country=r.get("country", ""),
-                record_date=r.get("record_date", ""),
-                competition_name=r.get("competition_name", ""),
-                location=r.get("city", ""),
-                source_name=r.get("source_name", "CONSANAT"),
-                source_url=r.get("source_url", CONS_NATACION_URL),
-            )
-
-            status, _ = sb.upsert_record(payload)
-            prueba = f"{r['gender']} {r['distance']}m {r['stroke']} ({r['pool']})"
-            if status == "inserted":
-                stats["inserted"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "", payload["time_clock"])
-            elif status == "updated":
-                stats["updated"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "(changed)", payload["time_clock"])
-            elif status == "filled":
-                stats["filled"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "(fill)", payload["time_clock"])
-            else:
-                stats["unchanged"] += 1
-
+        source_used = "CONSANAT"
+        if not rows:
+            print("⚠️ CONSANAT respondió pero parse=0; activo fallback Wikipedia.")
+            raise RuntimeError("CONSANAT parse=0")
     except Exception as e:
         stats["errors"] += 1
-        sb.log("ERROR", "CONSANAT", f"{e}")
+        sb.log("ERROR", "CONSANAT", "", message=str(e) + "\n" + traceback.format_exc())
+
+        # 2) Fallback Wikipedia
+        try:
+            html = fetch_with_retries(WIKI_SAM_URL, tries=3, connect_timeout=20, read_timeout=60, tag="WIKI_SAM fetch")
+            rows = wiki_sam_parse(html)
+            source_used = "WIKI_SAM"
+            if not rows:
+                raise RuntimeError("Wikipedia Sudamérica parse=0")
+        except Exception as e2:
+            stats["errors"] += 1
+            sb.log("ERROR", "WIKI_SAM", "", message=str(e2) + "\n" + traceback.format_exc())
+            return stats
+
+    for r in rows:
+        stats["seen"] += 1
+        record_scope = "Sudamericano"
+        record_type = "Récord Sudamericano" + (" SC" if r["pool"] == "SCM" else "")
+
+        payload = build_payload(
+            record_scope=record_scope,
+            record_type=record_type,
+            pool=r["pool"],
+            gender=r["gender"],
+            distance=r["distance"],
+            stroke=r["stroke"],
+            time_ms=r["time_ms"],
+            athlete=r.get("athlete", ""),
+            country=r.get("country", ""),
+            record_date=r.get("date", ""),
+            comp_name=r.get("comp", ""),
+            comp_location=r.get("city", ""),
+            source_name=("CONSANAT" if source_used == "CONSANAT" else r.get("source_name", "Wikipedia (Sudamérica)")),
+            source_url=(CONS_NATACION_URL if source_used == "CONSANAT" else r.get("source_url", WIKI_SAM_URL)),
+        )
+
+        try:
+            status, _ = sb.upsert_record(payload)
+            if status == "inserted":
+                stats["inserted"] += 1
+            elif status == "updated":
+                stats["updated"] += 1
+            elif status == "filled":
+                stats["filled"] += 1
+            else:
+                stats["unchanged"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            sb.log("ERROR", "UPSERT_SUDAM", payload.get("athlete_name",""), message=str(e) + "\n" + traceback.format_exc())
 
     return stats
 
-
-def run_panam(sb: SB) -> Dict[str, int]:
+def run_panam_games(sb: SB) -> Dict[str, int]:
     stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
+
     try:
-        html = panam_fetch(PANAM_AQUATICS_URL)
-        rows = panam_parse(html, PANAM_AQUATICS_URL)
+        html = wiki_panam_games_fetch()
+        rows = wiki_panam_games_parse(html)
         if not rows:
-            print('⚠️ PANAM: 0 filas con requests; intento renderizado Playwright…')
-            html2 = panam_fetch_rendered(PANAM_AQUATICS_URL)
-            rows = panam_parse(html2, PANAM_AQUATICS_URL)
-        if not rows:
-            raise RuntimeError('PANAM: 0 filas parseadas (probable contenido embebido/PDF/JS)')
-
-        for r in rows:
-            stats["seen"] += 1
-            record_scope = "Panamericano"
-            record_type = "Récord Panamericano" + (" SC" if r["pool"] == "SCM" else "")
-
-            payload = build_payload(
-                record_scope=record_scope,
-                record_type=record_type,
-                pool=r["pool"],
-                gender=r["gender"],
-                distance=r["distance"],
-                stroke=r["stroke"],
-                time_ms=r["time_ms"],
-                athlete=r.get("athlete", ""),
-                country=r.get("country", ""),
-                record_date=r.get("record_date", ""),
-                competition_name=r.get("competition_name", ""),
-                location=r.get("city", ""),
-                source_name=r.get("source_name", "PanAm Aquatics"),
-                source_url=r.get("source_url", PANAM_AQUATICS_URL),
-            )
-
-            status, _ = sb.upsert_record(payload)
-            prueba = f"{r['gender']} {r['distance']}m {r['stroke']} ({r['pool']})"
-            if status == "inserted":
-                stats["inserted"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "", payload["time_clock"])
-            elif status == "updated":
-                stats["updated"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "(changed)", payload["time_clock"])
-            elif status == "filled":
-                stats["filled"] += 1
-                sb.log(record_scope, prueba, payload.get("athlete_name", ""), "(fill)", payload["time_clock"])
-            else:
-                stats["unchanged"] += 1
-
+            raise RuntimeError("PanAm Games (Wikipedia) parse=0")
     except Exception as e:
         stats["errors"] += 1
-        sb.log("ERROR", "PANAM", f"{e}")
+        sb.log("ERROR", "PANAM_GAMES_WIKI", "", message=str(e) + "\n" + traceback.format_exc())
+        return stats
+
+    for r in rows:
+        stats["seen"] += 1
+        record_scope = "Panamericano"
+        record_type = "Récord Juegos Panamericanos"  # distinto de Continental Américas
+
+        payload = build_payload(
+            record_scope=record_scope,
+            record_type=record_type,
+            pool=r["pool"],
+            gender=r["gender"],
+            distance=r["distance"],
+            stroke=r["stroke"],
+            time_ms=r["time_ms"],
+            athlete=r.get("athlete", ""),
+            country=r.get("country", ""),
+            record_date=r.get("date", ""),
+            comp_name=r.get("comp", "Pan American Games"),
+            comp_location=r.get("city", ""),
+            source_name=r.get("source_name", "Wikipedia (PanAm Games)"),
+            source_url=r.get("source_url", WIKI_PANAM_GAMES_URL),
+        )
+
+        try:
+            status, _ = sb.upsert_record(payload)
+            if status == "inserted":
+                stats["inserted"] += 1
+            elif status == "updated":
+                stats["updated"] += 1
+            elif status == "filled":
+                stats["filled"] += 1
+            else:
+                stats["unchanged"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            sb.log("ERROR", "UPSERT_PANAM_GAMES", payload.get("athlete_name",""), message=str(e) + "\n" + traceback.format_exc())
 
     return stats
 
+# -------------------------- Email --------------------------
 
 def send_email(subject: str, body: str) -> None:
     if not EMAIL_USER or not EMAIL_PASS:
@@ -1120,6 +934,7 @@ def send_email(subject: str, body: str) -> None:
         s.login(EMAIL_USER, EMAIL_PASS)
         s.send_message(msg)
 
+# -------------------------- Main --------------------------
 
 def main() -> int:
     try:
@@ -1132,9 +947,10 @@ def main() -> int:
     print(f"RUN_ID={RUN_ID}")
 
     all_stats: Dict[str, Dict[str, int]] = {}
+
     all_stats["WA"] = run_wa(sb)
-    all_stats["CONSANAT"] = run_consanat(sb)
-    all_stats["PANAM"] = run_panam(sb)
+    all_stats["SUDAM"] = run_sudamerica(sb)
+    all_stats["PANAM_GAMES"] = run_panam_games(sb)
 
     lines = [
         f"Version: {MDV_UPDATER_VERSION}",
@@ -1144,22 +960,22 @@ def main() -> int:
     ]
     for k, st in all_stats.items():
         lines.append(
-            f"[{k}] seen={st['seen']} | inserted={st['inserted']} | updated={st['updated']} | filled={st['filled']} | "
-            f"unchanged={st['unchanged']} | skipped={st['skipped']} | errors={st['errors']}"
+            f"[{k}] seen={st['seen']} | inserted={st['inserted']} | updated={st['updated']} | filled={st['filled']} | unchanged={st['unchanged']} | skipped={st['skipped']} | errors={st['errors']}"
         )
-
     body = "\n".join(lines)
     print(body)
 
     try:
-        sb.log("RUN", "SUMMARY", json.dumps(all_stats, ensure_ascii=False))
+        sb.log("RUN", "SUMMARY", json.dumps(all_stats, ensure_ascii=False), message=body)
     except Exception:
         pass
 
     send_email(f"🏁 MDV Scraper | {RUN_ID} | {MDV_UPDATER_VERSION}", body)
-    total_errors = sum(st["errors"] for st in all_stats.values())
-    return 1 if total_errors else 0
 
+    total_errors = sum(st["errors"] for st in all_stats.values())
+    # Opcional: si querés que el workflow NO falle cuando solo fallan fuentes secundarias,
+    # podés cambiar esta línea a: return 0
+    return 1 if total_errors else 0
 
 if __name__ == "__main__":
     sys.exit(main())
