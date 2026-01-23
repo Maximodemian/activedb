@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MDV Records Updater v11 (WA + Sudamérica + Juegos Panamericanos + DataHub opcional)
+MDV Records Updater v12 (WA + Sudamérica + Juegos Panamericanos + DataHub opcional)
 
 Qué cambia vs v10
 - Detecta automáticamente columnas reales de la tabla (evita errores tipo "Could not find column ...").
@@ -61,7 +61,7 @@ except ModuleNotFoundError:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAMG+HUB_v11_SCHEMA_DETECT")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+CONS+PANAM_v12_RELAY_FIX")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -196,13 +196,46 @@ RELAY_RE = re.compile(
     re.IGNORECASE,
 )
 
-def parse_event(event_raw: str) -> Tuple[Optional[int], Optional[str]]:
-    """Devuelve (distance_m, stroke_es). En relevos, devuelve distancia del tramo (ej 4x100 -> 100)."""
-    if event_raw is None:
-        return None, None
-    s = str(event_raw).strip()
+def parse_event(event_raw: str) -> Tuple[Optional[int], Optional[str], bool]:
+    """Devuelve (distancia_m, estilo_es, is_relay)."""
+    s = (event_raw or "").strip()
     if not s:
-        return None, None
+        return None, None, False
+
+    is_relay = bool(RELAY_RE.search(s))
+
+    mm = re.search(r"(\d{2,4})\s*m", s, re.I)
+    if not mm:
+        mm = re.search(r"(\d{2,4})", s)
+    dist_m = int(mm.group(1)) if mm else None
+
+    m2 = EVENT_RE.search(s)
+    stroke_es = None
+    if m2:
+        raw = (m2.group("stroke") or "").lower()
+        stroke_es = STROKE_MAP.get(raw)
+
+    return dist_m, stroke_es, is_relay
+
+def infer_type_probe(event_raw: str, athlete_name: str, is_relay_flag: bool) -> str:
+    """Devuelve 'individual' o 'relay' con heurísticas tolerantes."""
+    if is_relay_flag:
+        return "relay"
+
+    a = (athlete_name or "").strip()
+    if not a:
+        return "individual"
+
+    # En relays suelen listarse 4 integrantes.
+    seps = [",", ";", " / ", " - ", " & ", " y "]
+    count = 0
+    for s in seps:
+        if s in a:
+            count += a.count(s)
+    if count >= 3:
+        return "relay"
+    return "individual"
+
 
     m = RELAY_RE.search(s)
     if m:
@@ -330,20 +363,25 @@ class SB:
         # fallback (tabla vacía o sin permisos de select)
         return sorted([
             "id",
-            "record_scope","record_type","category","pool_length","gender","stroke","distance",
+            "record_scope","record_type","category","pool_length","gender","stroke","distance","type_probe",
             "time_clock","time_ms",
-            "athlete_name","country","record_date","competition_name","city",
-            "source_name","source_url","notes","last_updated",
+            "athlete_name","country","record_date","competition_name","city","competition_country",
+            "source_name","source_url","notes","source_note","last_updated",
         ])
 
     def has(self, col: str) -> bool:
         return col in self.columns
 
     def _translate_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """El payload se arma con nombres semánticos (los de tu modelo).
-        Acá se filtran sólo las columnas existentes para evitar PGRST204.
-        """
+        """Filtra sólo columnas existentes (evita PGRST204) y aplica aliases."""
         out: Dict[str, Any] = {}
+
+        # alias: notes -> source_note (si existe en DB)
+        if ("notes" in payload) and (not self.has("notes")) and self.has("source_note"):
+            if payload.get("notes"):
+                payload = dict(payload)
+                payload["source_note"] = payload.get("notes")
+
         for k, v in payload.items():
             if self.has(k):
                 out[k] = v
@@ -351,17 +389,45 @@ class SB:
 
     def upsert_record(self, payload: Dict[str, Any], source_priority: int = 50) -> Tuple[str, Optional[Dict[str, Any]]]:
         """status: inserted|updated|filled|unchanged|skipped_lower_priority"""
-        required = ["record_scope","record_type","category","pool_length","gender","stroke","distance"]
+        base_required = ["record_scope","record_type","category","pool_length","gender","stroke","distance"]
+        required = list(base_required)
+        if self.has("type_probe"):
+            required.append("type_probe")
+
         for k in required:
             if payload.get(k) in (None, ""):
                 raise ValueError(f"payload missing {k}")
 
-        # query existente por llave compuesta
-        q = self.client.table("records_standards").select("*")
-        for k in required:
-            q = q.eq(k, payload[k])
-        existing_resp = q.limit(1).execute()
-        existing = (existing_resp.data or [None])[0]
+        def _query(keys: List[str]) -> Optional[Dict[str, Any]]:
+            q = self.client.table("records_standards").select("*")
+            for kk in keys:
+                q = q.eq(kk, payload[kk])
+            resp = q.limit(5).execute()
+            data = resp.data or []
+            if not data:
+                return None
+            if "type_probe" in keys:
+                return data[0]
+            if self.has("type_probe"):
+                tp = (payload.get("type_probe") or "").strip().lower()
+                for row in data:
+                    rtp = (row.get("type_probe") or "").strip().lower()
+                    if tp and rtp and tp == rtp:
+                        return row
+                for row in data:
+                    rtp = (row.get("type_probe") or "").strip()
+                    if not rtp:
+                        return row
+            return data[0]
+
+        existing = _query(required)
+        backfill_type_probe = False
+        if (existing is None) and self.has("type_probe"):
+            cand = _query(base_required)
+            if cand and (cand.get("type_probe") in (None, "")):
+                existing = cand
+                backfill_type_probe = True
+
 
         # normaliza tiempos
         new_ms = payload.get("time_ms")
@@ -396,7 +462,7 @@ class SB:
             old_pri = 10
 
         # Fill fields (solo si existen en DB)
-        candidate_fill = ["athlete_name","country","record_date","competition_name","city","source_name","source_url","notes"]
+        candidate_fill = ["athlete_name","country","record_date","competition_name","city","competition_country","source_name","source_url","notes"]
         updates: Dict[str, Any] = {}
 
         for f in candidate_fill:
@@ -409,7 +475,11 @@ class SB:
             if oldv is None or str(oldv).strip() == "":
                 updates[f] = newv
 
-        # Update time si cambió y la fuente no es de menor prioridad
+                # backfill de type_probe (para filas viejas con NULL/vacío)
+        if backfill_type_probe and self.has("type_probe") and payload.get("type_probe"):
+            updates.setdefault("type_probe", payload.get("type_probe"))
+
+# Update time si cambió y la fuente no es de menor prioridad
         if time_changed:
             if source_priority < old_pri:
                 # no pisamos con fuente "más débil"
@@ -652,7 +722,7 @@ def consanat_parse(html: str) -> List[Dict[str, Any]]:
                 location = rows[i + 5]
                 comp = rows[i + 6]
 
-                dist, stroke = parse_event(event)
+                dist, stroke, is_relay = parse_event(event)
                 ms = parse_time_to_ms(t)
                 if dist is None or stroke is None or ms is None:
                     continue
@@ -768,7 +838,7 @@ def wiki_sudam_parse(html: str) -> List[Dict[str, Any]]:
             meet = cells[i_meet] if (i_meet is not None and i_meet < len(cells)) else ""
             loc = cells[i_loc] if (i_loc is not None and i_loc < len(cells)) else ""
 
-            dist, stroke = parse_event(event)
+            dist, stroke, is_relay = parse_event(event)
             ms = parse_time_to_ms(t_raw)
             if dist is None or stroke is None or ms is None:
                 continue
@@ -868,7 +938,7 @@ def wiki_panam_games_parse(html: str) -> List[Dict[str, Any]]:
             meet = cells[i_meet] if (i_meet is not None and i_meet < len(cells)) else ""
             loc = cells[i_loc] if (i_loc is not None and i_loc < len(cells)) else ""
 
-            dist, stroke = parse_event(event)
+            dist, stroke, is_relay = parse_event(event)
             ms = parse_time_to_ms(t_raw)
             if dist is None or stroke is None or ms is None:
                 continue
@@ -1004,7 +1074,7 @@ def datahub_parse(text: str) -> List[Dict[str, Any]]:
         gender = parts[i_gender].strip() if i_gender is not None and i_gender < len(parts) else "M"
         pool = parts[i_pool].strip() if i_pool is not None and i_pool < len(parts) else "LCM"
 
-        dist, stroke = parse_event(event)
+        dist, stroke, is_relay = parse_event(event)
         ms = parse_time_to_ms(t_raw)
         if dist is None or stroke is None or ms is None:
             continue
@@ -1033,7 +1103,6 @@ def datahub_parse(text: str) -> List[Dict[str, Any]]:
 def build_payload(
     record_scope: str,
     record_type: str,
-    category: str = "Open",
     pool: str,
     gender: str,
     distance: int,
@@ -1044,10 +1113,18 @@ def build_payload(
     record_date: str,
     competition_name: str,
     city: str,
+    comp_country: str,
     source_name: str,
     source_url: str,
+    type_probe: str,
+    category: str = "Open",
     notes: str = "",
 ) -> Dict[str, Any]:
+    iso = to_iso3(athlete_country) if athlete_country else ""
+
+    time_ms = int(time_ms)
+    time_clock = format_ms_to_clock(time_ms)
+
     return {
         "record_scope": record_scope,
         "record_type": record_type,
@@ -1056,13 +1133,15 @@ def build_payload(
         "gender": gender_label(gender),
         "distance": int(distance),
         "stroke": stroke,
-        "time_ms": int(time_ms),
-        "time_clock": format_ms_to_clock(int(time_ms)),
+        "type_probe": (type_probe or "individual"),
+        "time_clock": time_clock,
+        "time_ms": time_ms,
         "athlete_name": athlete or "",
-        "country": to_iso3(athlete_country) or (athlete_country or ""),
+        "country": iso or athlete_country or "",
         "record_date": record_date or "",
         "competition_name": competition_name or "",
         "city": city or "",
+        "competition_country": comp_country or "",
         "source_name": source_name or "",
         "source_url": source_url or "",
         "notes": notes or "",
