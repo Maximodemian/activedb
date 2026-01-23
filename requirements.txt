@@ -1,11 +1,7 @@
 requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.2.2
-pandas==2.2.2
-python-dateutil==2.9.0.post0
-rapidfuzz==3.9.5
-supabase==2.6.0
-postgrest==0.16.10
-gotrue==2.5.4
-storage3==0.7.7
-playwright==1.46.0
+lxml==5.3.0
+openpyxl==3.1.5
+playwright==1.49.0
+supabase==2.11.0
+python-dotenv==1.0.1
