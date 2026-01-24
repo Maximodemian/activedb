@@ -517,6 +517,29 @@ def wa_extract_rows(url: str) -> List[Dict[str, Any]]:
 # --------------------- World Aquatics (API) ----------------------
 
 WA_API_BASE = "https://api.worldaquatics.com/fina/records/report"
+WA_WEB_BASE = "https://www.worldaquatics.com/swimming/records"
+
+def wa_web_url(record_code: str, gender: str, pool: str, region: str = "") -> str:
+    """Fallback URL (public records page) used by v15 runs when API export is weird/encoded."""
+    params = {
+        "eventTypeId": "",
+        "region": region or "",
+        "countryId": "",
+        "gender": gender,
+        "pool": pool,
+    }
+    rc = (record_code or "").upper().strip()
+    if rc == "WR":
+        params["recordType"] = "WR"
+    elif rc == "CR":
+        # Continental records page uses recordType=PAN with recordCode=CR (as per v15 good run)
+        params["recordType"] = "PAN"
+        params["recordCode"] = "CR"
+    else:
+        params["recordCode"] = rc
+    return WA_WEB_BASE + "?" + urlencode(params)
+
+
 
 def wa_api_url(record_code: str, gender: str, pool: str, region: str = "") -> str:
     params = {
@@ -560,7 +583,7 @@ def wa_parse_report_csv(text: str) -> List[Dict[str, Any]]:
     Parse the World Aquatics `records/report` CSV-ish export.
     It sometimes comes with a header row, sometimes without (depends on server version / caching).
     """
-    txt = (text or "").lstrip("\ufeff").strip()
+    txt = (text or "").replace("\x00","").lstrip("\ufeff").strip()
     if not txt:
         return []
 
@@ -631,10 +654,22 @@ def wa_parse_report_csv(text: str) -> List[Dict[str, Any]]:
     return out
 
 def wa_fetch_report_rows(record_code: str, gender: str, pool: str, region: str = "") -> Tuple[str, List[Dict[str, Any]]]:
+    """Try WA API export first; if it fails (encoding/NUL/format), fallback to public records page parse."""
     url = wa_api_url(record_code=record_code, gender=gender, pool=pool, region=region)
-    # Ask for CSV explicitly
-    txt = fetch_text(url, headers={"Accept": "text/csv,*/*"})
-    return url, wa_parse_report_csv(txt)
+    try:
+        # Ask for CSV explicitly
+        txt = fetch_text(url, headers={"Accept": "text/csv,*/*"})
+        rows = wa_parse_report_csv(txt)
+        if rows:
+            return url, rows
+    except Exception:
+        # fallback below
+        pass
+
+    web_url = wa_web_url(record_code=record_code, gender=gender, pool=pool, region=region)
+    rows2 = wa_extract_rows(web_url)
+    return web_url, rows2
+
 
 
 def run_wa(sb: SB, dry_run: bool, stats: UpsertStats) -> None:
@@ -989,7 +1024,7 @@ def wiki_parse_panam_games() -> Tuple[str, List[Dict[str, Any]]]:
                 continue
             out_rows.extend(wiki_parse_table(tb, g, "LCM"))
 
-    return out_rows
+    return url, out_rows
 
 
 def run_sudam(sb: SB) -> UpsertStats:
