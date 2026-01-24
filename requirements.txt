@@ -1,7 +1,8 @@
-requests>=2.31.0
-beautifulsoup4>=4.12.2
-lxml>=5.1.0
-openpyxl>=3.1.2
-playwright>=1.41.0
-python-dotenv>=1.0.1
-supabase>=2.3.0
+requests
+beautifulsoup4
+lxml
+pandas
+openpyxl
+playwright
+python-dotenv
+supabase
