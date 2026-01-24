@@ -28,17 +28,11 @@ jobs:
 
       - name: Run updater
         env:
-          # Supabase (NO imprime valores)
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-
-          # Acepta cualquiera de las dos (tu script usa SERVICE_ROLE_KEY o KEY)
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
-          # Si vos guardaste SOLO service role y NO SUPABASE_KEY,
-          # igual queda cubierto porque el script puede leer SERVICE_ROLE_KEY.
-          # Si querés forzar alias, descomentá:
-          # SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-
+          # Opcionales:
+          # MDV_STRICT: "1"
+          # WA_INCLUDE_MIXED: "1"
         run: |
           python -u updater_final.py
