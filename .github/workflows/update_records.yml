@@ -1,12 +1,12 @@
-name: Update swimming records
+name: Update Records
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"  # 03:00 UTC (ajustalo si querés)
+    - cron: "0 1 * * *"
 
 jobs:
-  update:
+  update-records:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -28,21 +28,17 @@ jobs:
 
       - name: Run updater
         env:
-          PYTHONUNBUFFERED: "1"
+          # Supabase (NO imprime valores)
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+          # Acepta cualquiera de las dos (tu script usa SERVICE_ROLE_KEY o KEY)
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # fallback opcional (por si tu script acepta SUPABASE_KEY)
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+
+          # Si vos guardaste SOLO service role y NO SUPABASE_KEY,
+          # igual queda cubierto porque el script puede leer SERVICE_ROLE_KEY.
+          # Si querés forzar alias, descomentá:
+          # SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
         run: |
           python -u updater_final.py
-
-      - name: Upload logs artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs
-          path: |
-            logs/**
-            **/*log*
-            **/*logs*
-          if-no-files-found: ignore
