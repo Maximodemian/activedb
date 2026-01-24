@@ -24,6 +24,9 @@ import os
 import re
 import sys
 import time
+import csv
+import io
+from urllib.parse import urlencode
 import json
 import math
 import hashlib
@@ -220,12 +223,48 @@ def gender_from_text(ctx: str) -> Optional[str]:
     return None
 
 
+
+
+def pool_from_text(ctx: str) -> Optional[str]:
+    """Infer pool length (LCM/SCM) from nearby heading/caption text."""
+    t = (ctx or "").lower()
+    # Short course (25m)
+    if any(k in t for k in ["scm", "short course", "25m", "25 m", "25-m", "25 metre", "25 meter", "piscina corta"]):
+        return "SCM"
+    # Long course (50m)
+    if any(k in t for k in ["lcm", "long course", "50m", "50 m", "50-m", "50 metre", "50 meter", "piscina larga"]):
+        return "LCM"
+    return None
+
 # -------------------------- HTTP fetch --------------------------
 
 def fetch_html(url: str, timeout: int = HTTP_TIMEOUT) -> str:
     r = requests.get(url, headers=HEADERS, timeout=timeout)
     r.raise_for_status()
     return r.text
+
+
+def fetch_text(url: str, timeout: int = HTTP_TIMEOUT, headers: Optional[Dict[str, str]] = None,
+               retries: int = 3, backoff: float = 1.7) -> str:
+    """GET text with retries (useful for API endpoints that occasionally throttle)."""
+    h = dict(HEADERS)
+    if headers:
+        h.update(headers)
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=h, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(backoff ** (attempt - 1))
+            else:
+                break
+    raise last_err or RuntimeError(f"Failed to fetch: {url}")
+
 
 
 # -------------------------- Supabase layer --------------------------
@@ -474,108 +513,282 @@ def wa_extract_rows(url: str) -> List[Dict[str, Any]]:
     return parse_worldaquatics_records_page(html)
 
 
-def run_wa(sb: SB) -> UpsertStats:
-    stats = UpsertStats()
 
-    # record_type config
-    # WR, WJ, OR and Continental (Americas)
+# --------------------- World Aquatics (API) ----------------------
+
+WA_API_BASE = "https://api.worldaquatics.com/fina/records/report"
+
+def wa_api_url(record_code: str, gender: str, pool: str, region: str = "") -> str:
+    params = {
+        "countryId": "",
+        "eventTypeId": "",
+        "gender": gender,
+        "pool": pool,
+        "recordCode": record_code,
+        "region": region or "",
+    }
+    return WA_API_BASE + "?" + urlencode(params)
+
+def _wa_find_event_cell(row: List[str]) -> Optional[str]:
+    # Most exports include the event name near the end, preceded by an event id (e.g., "10, Men 100m Backstroke")
+    for cell in reversed(row):
+        c = (cell or "").strip()
+        if not c:
+            continue
+        lc = c.lower()
+
+        # skip pure time-like cells
+        if re.fullmatch(r"\d{1,2}:\d{2}\.\d{2}", c) or re.fullmatch(r"\d{1,2}:\d{2}\.\d{1,2}", c) or re.fullmatch(r"\d{1,2}\.\d{2}", c):
+            continue
+
+        if "relay" in lc or "relevo" in lc:
+            return c
+        if any(w in lc for w in ["men", "women", "mixed"]):
+            if "m" in lc:
+                return c
+        if re.search(r"\b\d{2,4}\s*m\b", lc) and any(
+            k in lc for k in [
+                "freestyle","backstroke","breaststroke","butterfly","medley","individual medley",
+                "libre","espalda","pecho","mariposa","combinado","mixto",
+            ]
+        ):
+            return c
+    return None
+
+def wa_parse_report_csv(text: str) -> List[Dict[str, Any]]:
+    """
+    Parse the World Aquatics `records/report` CSV-ish export.
+    It sometimes comes with a header row, sometimes without (depends on server version / caching).
+    """
+    txt = (text or "").lstrip("\ufeff").strip()
+    if not txt:
+        return []
+
+    reader = csv.reader(io.StringIO(txt), skipinitialspace=True)
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        return []
+
+    header = None
+    start = 0
+    if rows[0] and "record" in rows[0][0].lower() and "description" in rows[0][0].lower():
+        header = [norm_text(h).lower() for h in rows[0]]
+        start = 1
+
+    def idx_like(keys: List[str]) -> Optional[int]:
+        if not header:
+            return None
+        for i, h in enumerate(header):
+            for k in keys:
+                if k in h:
+                    return i
+        return None
+
+    i_time = idx_like(["time"])
+    i_athlete = idx_like(["athlete", "swimmer", "name"])
+    i_nf = idx_like(["nf code", "noc", "nf"])
+    i_gender = idx_like(["gender"])
+    i_comp = idx_like(["competition", "meet", "games"])
+    i_country = idx_like(["country"])
+    i_city = idx_like(["city"])
+    i_date = idx_like(["date"])
+    i_event = idx_like(["event"])
+
+    out: List[Dict[str, Any]] = []
+
+    for row in rows[start:]:
+        def get(i: Optional[int]) -> str:
+            if i is None or i < 0 or i >= len(row):
+                return ""
+            return norm_text(row[i])
+
+        timev = get(i_time) if i_time is not None else (norm_text(row[2]) if len(row) > 2 else "")
+        athlete = get(i_athlete) if i_athlete is not None else (norm_text(row[3]) if len(row) > 3 else "")
+        nf = get(i_nf) if i_nf is not None else (norm_text(row[4]) if len(row) > 4 else "")
+        comp = get(i_comp) if i_comp is not None else (norm_text(row[6]) if len(row) > 6 else "")
+        country = get(i_country) if i_country is not None else (norm_text(row[7]) if len(row) > 7 else "")
+        city = get(i_city) if i_city is not None else (norm_text(row[8]) if len(row) > 8 else "")
+        datev = get(i_date)
+        event = get(i_event) if i_event is not None else _wa_find_event_cell([norm_text(c) for c in row])
+
+        if not (event and timev and athlete):
+            continue
+
+        loc = ", ".join([x for x in [country, city] if x])
+
+        out.append(
+            {
+                "event": event,
+                "time": timev,
+                "athlete": athlete,
+                "athlete_country": nf,
+                "record_date": datev,
+                "competition_name": comp,
+                "competition_location": loc,
+            }
+        )
+
+    return out
+
+def wa_fetch_report_rows(record_code: str, gender: str, pool: str, region: str = "") -> Tuple[str, List[Dict[str, Any]]]:
+    url = wa_api_url(record_code=record_code, gender=gender, pool=pool, region=region)
+    # Ask for CSV explicitly
+    txt = fetch_text(url, headers={"Accept": "text/csv,*/*"})
+    return url, wa_parse_report_csv(txt)
+
+
+def run_wa(sb: SB, dry_run: bool, stats: UpsertStats) -> None:
+    print("\n=== WORLD AQUATICS (records/report API) ===")
+
+    # record_type: stored in DB; record_code: used for the WA API request
     tasks = [
-        ("Récord Mundial", "Mundial", "WR", "LCM", "M"),
-        ("Récord Mundial", "Mundial", "WR", "LCM", "F"),
-        ("Récord Mundial SC", "Mundial", "WR", "SCM", "M"),
-        ("Récord Mundial SC", "Mundial", "WR", "SCM", "F"),
-        ("Récord Mundial Junior", "Mundial", "WJ", "LCM", "M"),
-        ("Récord Mundial Junior", "Mundial", "WJ", "LCM", "F"),
-        ("Récord Mundial Junior SC", "Mundial", "WJ", "SCM", "M"),
-        ("Récord Mundial Junior SC", "Mundial", "WJ", "SCM", "F"),
-        ("Récord Olímpico", "Olímpico", "OR", "LCM", "M"),
-        ("Récord Olímpico", "Olímpico", "OR", "LCM", "F"),
-        ("Récord Continental Américas", "Américas", "CR_AMERICAS", "LCM", "M"),
-        ("Récord Continental Américas", "Américas", "CR_AMERICAS", "LCM", "F"),
-        ("Récord Continental Américas SC", "Américas", "CR_AMERICAS", "SCM", "M"),
-        ("Récord Continental Américas SC", "Américas", "CR_AMERICAS", "SCM", "F"),
+        {
+            "label": "Récord Mundial",
+            "record_scope": "Mundial",
+            "record_type": "WR",
+            "record_code": "WR",
+            "region": "",
+            "pools": ["LCM", "SCM"],
+            "genders": ["M", "F", "X"],
+            "source_name": "WORLD AQUATICS",
+        },
+        {
+            "label": "Récord Mundial Junior",
+            "record_scope": "Mundial Junior",
+            "record_type": "WJ",
+            "record_code": "WJ",
+            "region": "",
+            "pools": ["LCM", "SCM"],
+            "genders": ["M", "F", "X"],
+            "source_name": "WORLD AQUATICS",
+        },
+        {
+            "label": "Récord Olímpico",
+            "record_scope": "Olímpico",
+            "record_type": "OR",
+            "record_code": "OR",
+            "region": "",
+            "pools": ["LCM"],
+            "genders": ["M", "F", "X"],
+            "source_name": "WORLD AQUATICS",
+        },
+        {
+            # World Aquatics uses recordCode=AM for Americas records, plus region=AMERICAS
+            "label": "Récord Continental Américas",
+            "record_scope": "Américas",
+            "record_type": "CR",
+            "record_code": "AM",
+            "region": "AMERICAS",
+            "pools": ["LCM", "SCM"],
+            "genders": ["M", "F", "X"],
+            "source_name": "WORLD AQUATICS",
+        },
     ]
-
-    def build_url(code: str, pool: str, gender: str) -> str:
-        if code == "WR":
-            return f"https://www.worldaquatics.com/swimming/records?recordType=WR&eventTypeId=&region=&countryId=&gender={gender}&pool={pool}"
-        if code == "WJ":
-            return f"https://www.worldaquatics.com/swimming/records?recordCode=WJ&eventTypeId=&region=&countryId=&gender={gender}&pool={pool}"
-        if code == "OR":
-            return f"https://www.worldaquatics.com/swimming/records?recordType=OR&eventTypeId=&region=&countryId=&gender={gender}&pool={pool}"
-        if code == "CR_AMERICAS":
-            return f"https://www.worldaquatics.com/swimming/records?recordType=PAN&recordCode=CR&eventTypeId=&region=AMERICAS&countryId=&gender={gender}&pool={pool}"
-        raise ValueError(code)
 
     fill_fields = [
         "time_ms",
         "time_clock",
         "time_clock_2dp",
         "athlete_name",
-        "country",
+        "athlete_country",
         "record_date",
         "competition_name",
         "competition_location",
-        "source_url",
         "source_name",
+        "source_url",
         "source_note",
-        "type_probe",
     ]
 
-    for record_type, record_scope, code, pool, g in tasks:
-        url = build_url(code, pool, g)
-        print(f"🔎 WA | {code} | {pool} | {g} | {url}")
-        try:
-            rows = wa_extract_rows(url)
-            for r in rows:
-                # header names can vary; try multiple keys
-                event = r.get("Event") or r.get("Discipline") or r.get("Record") or r.get("col0")
-                timev = r.get("Time") or r.get("Mark") or r.get("col1")
-                athlete = r.get("Athlete") or r.get("Name") or r.get("Competitor") or r.get("col2")
-                country = r.get("Country") or r.get("Nation") or r.get("Nationality") or r.get("col3")
-                datev = r.get("Date") or r.get("col4")
-                comp = r.get("Competition") or r.get("Meet") or r.get("Event")  # sometimes same
-                loc = r.get("Location") or r.get("Venue") or r.get("col5")
-
-                payload = build_payload(
-                    gender=g,
-                    category="Open",
-                    pool=pool,
-                    event=event,
-                    record_type=record_type,
-                    record_scope=record_scope,
-                    time_raw=timev,
-                    athlete_name=athlete,
-                    athlete_country=country,
-                    record_date=datev,
-                    competition_name=comp or "",
-                    competition_location=loc or "",
-                    source_url=url,
-                    source_name="World Aquatics",
-                    source_note="",
-                )
-                if not payload:
-                    stats.skipped += 1
+    for t in tasks:
+        for pool in t["pools"]:
+            for gender in t["genders"]:
+                try:
+                    source_url, rows = wa_fetch_report_rows(
+                        record_code=t["record_code"],
+                        gender=gender,
+                        pool=pool,
+                        region=t["region"],
+                    )
+                except Exception as e:
+                    stats.errors += 1
+                    print(f"❌ WA ERROR {t['label']} {pool} {gender}: {e}")
                     continue
-                sb.upsert_record(payload, stats, fill_fields)
-        except Exception as e:
-            stats.errors += 1
-            print(f"❌ WA {code} {pool} {g} error: {e}")
 
-    return stats
+                if not rows:
+                    stats.errors += 1
+                    print(f"❌ WA EMPTY {t['label']} {pool} {gender}: 0 filas (fallo de scrape/API)")
+                    continue
 
+                print(f"✅ WA {t['label']} | {pool} | {gender}: {len(rows)} filas")
 
-# -------------------------- Wikipedia scrapers --------------------------
+                for r in rows:
+                    payload = build_payload(
+                        source_name=t["source_name"],
+                        source_url=source_url,
+                        source_note=f"recordCode={t['record_code']}; region={t['region'] or 'ALL'}",
+                        record_type=t["record_type"],
+                        record_scope=t["record_scope"],
+                        pool=pool,
+                        gender=gender,
+                        category="Absoluto",
+                        event=r.get("event") or "",
+                        time_raw=r.get("time") or "",
+                        athlete_name=r.get("athlete") or "",
+                        athlete_country=r.get("athlete_country") or "",
+                        record_date=r.get("record_date") or "",
+                        competition_name=r.get("competition_name") or "",
+                        competition_location=r.get("competition_location") or "",
+                    )
 
+                    if payload is None:
+                        stats.skipped += 1
+                        continue
+
+                    if dry_run:
+                        stats.seen += 1
+                        continue
+
+                    sb.upsert_record(payload, stats, fill_fields=fill_fields)
 
 def wiki_parse_table(table, gender_fixed: Optional[str], pool_fixed: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Parse a Wikipedia "wikitable" containing swimming records.
+
+    IMPORTANT: Wikipedia record tables often use <th scope="row"> for the event name in each data row.
+    So we must:
+      1) detect the real header row (column headers),
+      2) read row cells using both <th> and <td> to keep alignment.
+    """
     out: List[Dict[str, Any]] = []
-    headers = [norm_text(th.get_text(" ", strip=True)).lower() for th in table.find_all("th")]
+
+    # 1) Detect header row (column headers only, NOT all <th> in the table)
+    headers: List[str] = []
+    header_tr = None
+    for tr in table.find_all("tr"):
+        ths = tr.find_all("th")
+        if not ths:
+            continue
+        txt = norm_text(tr.get_text(" ", strip=True)).lower()
+        # Heuristic: a header row usually contains the word "event" / "time" and has several <th>
+        if len(ths) >= 3 and (("event" in txt) or ("time" in txt) or any((th.get("scope") or "").lower() in ("col", "colgroup") for th in ths)):
+            headers = [norm_text(th.get_text(" ", strip=True)).lower() for th in ths]
+            header_tr = tr
+            break
+    if not headers:
+        # Fallback: first row with >=3 cells (th+td)
+        tr0 = table.find("tr")
+        if tr0:
+            cells0 = tr0.find_all(["th", "td"])
+            if len(cells0) >= 3:
+                headers = [norm_text(c.get_text(" ", strip=True)).lower() for c in cells0]
+                header_tr = tr0
+
     if not headers:
         return out
 
     def col_idx(*names: str) -> Optional[int]:
         for n in names:
+            n = n.lower()
             for i, h in enumerate(headers):
                 if n in h:
                     return i
@@ -584,32 +797,50 @@ def wiki_parse_table(table, gender_fixed: Optional[str], pool_fixed: Optional[st
     i_event = col_idx("event", "prueba", "discipline")
     i_time = col_idx("time", "marca")
     i_name = col_idx("name", "athlete", "swimmer", "nadador")
-    i_country = col_idx("country", "nation", "país")
+    i_country = col_idx("nation", "country", "nf", "noc", "país", "pais")
     i_date = col_idx("date", "fecha")
-    i_games = col_idx("games", "competition", "meet", "torneo")
-    i_loc = col_idx("location", "place", "venue", "sede")
+    i_games = col_idx("meet", "competition", "games", "tournament", "campeonato")
+    i_loc = col_idx("location", "venue", "city", "place", "sede", "lugar")
 
-    # Some wiki pages have multirow headers; use tbody tr with td length
+    g = gender_fixed
+    p = pool_fixed
+
+    # 2) Parse rows
     for tr in table.find_all("tr"):
-        tds = tr.find_all("td")
-        if not tds:
+        if header_tr is not None and tr == header_tr:
             continue
-        vals = [norm_text(td.get_text(" ", strip=True)) for td in tds]
-        if i_event is None or i_time is None:
-            continue
-        if i_event >= len(vals) or i_time >= len(vals):
+        # skip header-like rows
+        if tr.find("th", attrs={"scope": "col"}):
             continue
 
-        event = vals[i_event]
-        timev = vals[i_time]
-        namev = vals[i_name] if i_name is not None and i_name < len(vals) else ""
-        countryv = vals[i_country] if i_country is not None and i_country < len(vals) else ""
-        datev = vals[i_date] if i_date is not None and i_date < len(vals) else ""
-        gamesv = vals[i_games] if i_games is not None and i_games < len(vals) else ""
-        locv = vals[i_loc] if i_loc is not None and i_loc < len(vals) else ""
+        cells = tr.find_all(["th", "td"])
+        if not cells:
+            continue
 
-        g = gender_fixed
-        p = pool_fixed
+        def cell_get(i: Optional[int]) -> str:
+            if i is None:
+                return ""
+            if i < 0 or i >= len(cells):
+                return ""
+            return norm_text(cells[i].get_text(" ", strip=True))
+
+        event = cell_get(i_event)
+        timev = cell_get(i_time)
+        namev = cell_get(i_name)
+        countryv = cell_get(i_country)
+        datev = cell_get(i_date)
+        gamesv = cell_get(i_games)
+        locv = cell_get(i_loc)
+
+        # Some tables put the event in the first cell as a row header (<th scope="row">)
+        if not event and cells:
+            first = norm_text(cells[0].get_text(" ", strip=True))
+            if any(k in first.lower() for k in ["m", "relay", "relevo", "freestyle", "backstroke", "breaststroke", "butterfly", "medley", "individual medley"]):
+                event = first
+
+        if not (event and timev and namev):
+            continue
+
         out.append(
             {
                 "gender": g,
@@ -626,43 +857,81 @@ def wiki_parse_table(table, gender_fixed: Optional[str], pool_fixed: Optional[st
 
     return out
 
-
 def wiki_parse_sudam() -> List[Dict[str, Any]]:
-    url = "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Sudam%C3%A9rica_de_nataci%C3%B3n"
+    """
+    South American records (Wikipedia).
+
+    Wikipedia pages often structure records by headings like:
+      - Men's long course (50 m)
+      - Women's short course (25 m)
+    and then tables.
+
+    We walk the main content in document order and keep the last-seen (gender, pool) context from headings/captions.
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_South_American_records_in_swimming"
     html = fetch_html(url)
     soup = BeautifulSoup(html, "lxml")
-    tables = soup.select("table.wikitable")
-    rows_all: List[Dict[str, Any]] = []
 
-    # Heuristic: caption or previous heading indicates gender + pool.
-    for table in tables:
-        ctx = ""
-        cap = table.find("caption")
-        if cap:
-            ctx = cap.get_text(" ", strip=True)
-        if not ctx:
-            prev = table.find_previous(["h2", "h3", "h4", "h5"])
-            if prev:
-                ctx = prev.get_text(" ", strip=True)
+    content = soup.select_one("#mw-content-text .mw-parser-output") or soup.body or soup
+    out: List[Dict[str, Any]] = []
 
-        g = gender_from_text(ctx)
-        # pool
-        p = None
-        t = (ctx or "").lower()
-        if any(k in t for k in ("larga", "50", "lcm", "long course")):
-            p = "LCM"
-        elif any(k in t for k in ("corta", "25", "scm", "short course")):
-            p = "SCM"
+    cur_gender: Optional[str] = None
+    cur_pool: Optional[str] = None
 
-        # If we can't infer, skip table (better than wrong gender)
-        if g is None or p is None:
+    def update_ctx(text: str) -> None:
+        nonlocal cur_gender, cur_pool
+        g = gender_from_text(text)
+        p = pool_from_text(text)
+        if g:
+            cur_gender = g
+        if p:
+            cur_pool = p
+
+    # Walk top-level nodes in the content area (order matters)
+    for node in content.find_all(recursive=False):
+        if node.name in ("h2", "h3", "h4", "h5"):
+            update_ctx(node.get_text(" ", strip=True))
             continue
 
-        rows_all.extend(wiki_parse_table(table, g, p))
+        if node.name != "table":
+            # also learn from paragraphs / list items that sometimes contain "Long course" headings
+            if node.name in ("p", "div"):
+                t = node.get_text(" ", strip=True)
+                if t:
+                    update_ctx(t)
+            continue
 
-    # fallback: if nothing inferred, parse all tables with unknowns (will be skipped later)
-    return rows_all
+        if "wikitable" not in node.get("class", []):
+            continue
 
+        # Try caption / first header row as local context
+        cap = node.caption.get_text(" ", strip=True) if node.caption else ""
+        if cap:
+            update_ctx(cap)
+
+        header_text = ""
+        first_tr = node.find("tr")
+        if first_tr:
+            header_text = norm_text(first_tr.get_text(" ", strip=True))
+            if header_text:
+                update_ctx(header_text)
+
+        g = gender_from_text(cap) or gender_from_text(header_text) or cur_gender
+        p = pool_from_text(cap) or pool_from_text(header_text) or cur_pool
+
+        if not g or not p:
+            # last attempt: scan a bit more text from inside the table
+            sample = norm_text(node.get_text(" ", strip=True))[:300]
+            g = g or gender_from_text(sample)
+            p = p or pool_from_text(sample)
+
+        if not g or not p:
+            print(f"⚠️  SUDAM: skipping table (could not infer gender/pool). ctx_gender={cur_gender} ctx_pool={cur_pool} caption={cap[:80]!r}")
+            continue
+
+        out.extend(wiki_parse_table(node, g, p))
+
+    return out
 
 def wiki_parse_panam_games() -> Tuple[str, List[Dict[str, Any]]]:
     url = "https://en.wikipedia.org/wiki/List_of_Pan_American_Games_records_in_swimming"
@@ -720,7 +989,7 @@ def wiki_parse_panam_games() -> Tuple[str, List[Dict[str, Any]]]:
                 continue
             out_rows.extend(wiki_parse_table(tb, g, "LCM"))
 
-    return url, out_rows
+    return out_rows
 
 
 def run_sudam(sb: SB) -> UpsertStats:
