@@ -22,4 +22,11 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          - name: Run Masters Scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MAIL_USERNAME: ${{ secrets.EMAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.EMAIL_PASS }}
+        run: python update_masters.py
         run: python update_masters.py
