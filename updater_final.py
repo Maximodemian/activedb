@@ -38,7 +38,7 @@ except ModuleNotFoundError:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM+ARG_v15.4_STABLE_XLSX_MARKED_2026-01-24")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM+ARG_v15.5_STABLE_XLSX_MARKED_2026-01-24")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -72,7 +72,6 @@ WIKI_PANAM_GAMES_URL = "https://en.wikipedia.org/wiki/List_of_Pan_American_Games
 WIKI_ARG_URLS = [
     "https://es.wikipedia.org/wiki/R%C3%A9cords_argentinos_absolutos_de_nataci%C3%B3n",
     "https://en.wikipedia.org/wiki/List_of_Argentine_records_in_swimming",
-    "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Argentina_de_nataci%C3%B3n",  # fallback histórico
 ]
 
 
@@ -160,6 +159,11 @@ def format_ms_to_hms_2dp(ms: int) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}.{cent:02d}"
 
 def parse_date(raw: Any) -> Optional[str]:
+    """
+    Normaliza fechas a ISO (YYYY-MM-DD) para insertar en columna DATE.
+    - Limpia notas de Wikipedia tipo "[c]" o "[ note 1 ]"
+    - Soporta formatos EN y ES comunes.
+    """
     if raw is None:
         return None
     if isinstance(raw, (datetime, date)):
@@ -169,15 +173,42 @@ def parse_date(raw: Any) -> Optional[str]:
     if not s:
         return None
 
+    # Quita referencias/footnotes tipo "[c]" / "[ note 1 ]"
+    s = re.sub(r"\s*\[[^\]]+\]\s*", " ", s).strip()
+
+    # Normaliza espacios
+    s = re.sub(r"\s+", " ", s).strip()
+
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
 
-    try:
-        dt = datetime.strptime(s, "%d %B %Y")
-        return dt.date().isoformat()
-    except Exception:
-        pass
+    # English full / abbreviated
+    for fmt in ("%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.date().isoformat()
+        except Exception:
+            pass
 
+    # Spanish: "21 de diciembre de 2023"
+    m_es = re.match(r"^(\d{1,2})\s+de\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+)\s+de\s+(\d{4})$", s, re.I)
+    if m_es:
+        d = int(m_es.group(1))
+        mes = m_es.group(2).lower()
+        y = int(m_es.group(3))
+        meses = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+            "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9,
+            "octubre": 10, "noviembre": 11, "diciembre": 12,
+        }
+        mo = meses.get(mes)
+        if mo:
+            try:
+                return datetime(y, mo, d).date().isoformat()
+            except Exception:
+                return None
+
+    # Numeric: 21/12/2023 or 21-12-23
     m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$", s)
     if m:
         d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3))
@@ -472,7 +503,7 @@ def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
             athlete = norm(row[header_map.get("athlete", -1)]) if "athlete" in header_map else ""
             country = norm(row[header_map.get("country", -1)]) if "country" in header_map else ""
             date_raw = row[header_map.get("date", -1)] if "date" in header_map else ""
-            date_str = parse_date(date_raw) or norm(date_raw)
+            date_str = parse_date(date_raw) or None
 
             # ✅ FIX: location SIEMPRE inicializada
             location = norm(row[header_map.get("location", -1)]) if "location" in header_map else ""
@@ -593,7 +624,7 @@ def wiki_parse_records(url: str, default_pool: str = "LCM", default_gender: Opti
             swimmer = cells[c_swim] if (c_swim is not None and c_swim < len(cells)) else ""
             nat = cells[c_nat] if (c_nat is not None and c_nat < len(cells)) else ""
             d_raw = cells[c_date] if (c_date is not None and c_date < len(cells)) else ""
-            d_iso = parse_date(d_raw) or d_raw
+            d_iso = parse_date(d_raw) or None
             meet = cells[c_meet] if (c_meet is not None and c_meet < len(cells)) else ""
             loc = cells[c_loc] if (c_loc is not None and c_loc < len(cells)) else ""
 
@@ -654,7 +685,7 @@ def build_payload(
         "athlete_name": athlete_name or "",
         "country": athlete_country or "",  # atleta
         "city": "",                        # atleta (no suele venir)
-        "record_date": parse_date(record_date) or (record_date or None),
+        "record_date": parse_date(record_date) or None,
         "last_updated": RUN_DATE,
         "source_name": source_name or "",
         "source_url": source_url or "",
