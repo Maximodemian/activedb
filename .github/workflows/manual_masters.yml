@@ -18,11 +18,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
         
-      - name: Run Masters Scraper
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          - name: Run Masters Scraper
+      - name: Run Masters Scrape
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
