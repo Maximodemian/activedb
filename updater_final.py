@@ -1098,7 +1098,9 @@ def main() -> int:
 
     all_stats: Dict[str, UpsertStats] = {}
 
-    all_stats["WA"] = run_wa(sb)
+    wa_stats = UpsertStats()
+    run_wa(sb, dry_run=False, stats=wa_stats)
+    all_stats["WA"] = wa_stats
     all_stats["SUDAM"] = run_sudam(sb)
     all_stats["PANAM_GAMES"] = run_panam_games(sb)
 
