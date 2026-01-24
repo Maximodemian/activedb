@@ -473,20 +473,39 @@ def http_get(url: str, timeout: int = 30) -> str:
     return r.text
 
 def wiki_table_context(table) -> str:
+    """
+    Devuelve un contexto combinado para inferir género/piscina aunque la tabla tenga <caption>.
+    Wikipedia a menudo pone el género en el heading (h2/h3/h4) y el caption es genérico.
+    """
+    parts = []
+
     cap = table.find("caption")
     if cap:
-        return cap.get_text(" ", strip=True).lower()
-    prev = table.find_previous(["h2","h3","h4"])
+        parts.append(cap.get_text(" ", strip=True))
+
+    # Captura hasta 2 headings previos (p.ej. "Piscina larga" + "Masculino")
+    prev = table.find_previous(["h4", "h3", "h2"])
     if prev:
-        return prev.get_text(" ", strip=True).lower()
-    return ""
+        parts.append(prev.get_text(" ", strip=True))
+        prev2 = prev.find_previous(["h4", "h3", "h2"])
+        if prev2:
+            parts.append(prev2.get_text(" ", strip=True))
+
+    return " | ".join([p for p in parts if p]).lower()
+
 
 def wiki_guess_gender(ctx: str) -> Optional[str]:
-    if any(x in ctx for x in ["hombres","men"]):
+    # Masculino
+    if any(x in ctx for x in ["hombres", "hombre", "varones", "masculino", "men", "male", "boys"]):
         return "M"
-    if any(x in ctx for x in ["mujeres","women"]):
+    # Femenino
+    if any(x in ctx for x in ["mujeres", "mujer", "damas", "femenino", "women", "female", "girls"]):
         return "F"
+    # Mixto (si existiera)
+    if any(x in ctx for x in ["mixto", "mixed"]):
+        return "X"
     return None
+
 
 def wiki_guess_pool(ctx: str) -> Optional[str]:
     if any(x in ctx for x in ["piscina corta","short course","scm","25"]):
