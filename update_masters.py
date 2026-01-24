@@ -2,6 +2,10 @@ import os
 import requests
 import pdfplumber
 import io
+import smtplib
+import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -9,8 +13,73 @@ from supabase import create_client
 load_dotenv()
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
+# Configuración de Email (Usa los nombres de secretos que ya tengas en GitHub)
+EMAIL_SENDER = os.environ.get("MAIL_USERNAME") or os.environ.get("EMAIL_USER")
+EMAIL_PASSWORD = os.environ.get("MAIL_PASSWORD") or os.environ.get("EMAIL_PASSWORD")
+EMAIL_RECEIVER = "vorrabermauro@gmail.com" # Tu correo personal
+
+# Estadísticas Globales para el Reporte
+STATS = {
+    "extracted": 0,
+    "inserted": 0,
+    "male": 0,
+    "female": 0,
+    "errors": 0
+}
+
+def enviar_reporte_email(log_body, status="SUCCESS"):
+    """Envía el reporte final por email"""
+    if not EMAIL_SENDER or not EMAIL_PASSWORD:
+        print("⚠️ No se encontraron credenciales de email. Saltando envío.")
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = "Bot de Natación <" + EMAIL_SENDER + ">"
+        msg['To'] = EMAIL_RECEIVER
+        
+        icon = "🟢" if status == "SUCCESS" else "🔴"
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg['Subject'] = f"{icon} Reporte USMS Masters - {timestamp}"
+
+        body = f"""
+        Hola Mauro,
+        
+        Aquí tienes el resultado de la ejecución automática de marcas Masters (USMS).
+        
+        --------------------------------------------------
+        REPORTE DE EJECUCIÓN
+        --------------------------------------------------
+        Version: USMS_MASTERS_v4.0_AUTO_GENDER
+        Timestamp: {timestamp}
+        
+        {log_body}
+        
+        --------------------------------------------------
+        Detalles Técnicos:
+        - Origen: PDF Oficial USMS
+        - Motor: PDFPlumber + VelocityCheck
+        - Destino: Supabase (Tabla: standards_usa)
+        
+        Saludos,
+        Tu Ferrari de Datos 🏎️
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Conexión a Gmail
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, text)
+        server.quit()
+        print("📧 Email de reporte enviado correctamente.")
+        
+    except Exception as e:
+        print(f"❌ Error enviando email: {e}")
+
 def clean_time(time_str):
-    """Convierte tiempos a segundos de forma robusta"""
     try:
         time_str = str(time_str).strip().replace('*', '').replace('+', '')
         if ':' in time_str:
@@ -24,12 +93,7 @@ def clean_time(time_str):
         return None
 
 def extraer_tiempo_testigo(table):
-    """
-    Busca el tiempo de '50 Free' en la primera columna de edad (usualmente 18-24)
-    para usarlo como comparador de velocidad.
-    """
     try:
-        # Buscamos índice de columna de edad y fila de evento
         header_idx = -1
         for i, row in enumerate(table):
             row_str = " ".join([str(c) for c in row if c])
@@ -37,28 +101,23 @@ def extraer_tiempo_testigo(table):
                 header_idx = i
                 break
         
-        if header_idx == -1: return 9999.0 # Tabla inválida
+        if header_idx == -1: return 9999.0
 
-        # Buscamos la fila "50 Free"
         for row in table[header_idx+1:]:
             row_clean = [str(c).replace('\n', ' ').strip().upper() for c in row if c]
             if not row_clean: continue
-            
-            # Nombre del evento (columna 0)
             evt = row_clean[0]
             if "50" in evt and "FREE" in evt:
-                # Tomamos el primer tiempo (columna 1, que suele ser 18-24)
-                time_val = row[1] # Asumimos columna 1 es la primera edad
+                time_val = row[1] 
                 t_seg = clean_time(time_val)
                 if t_seg: return t_seg
-                
     except:
         pass
-    return 9999.0 # Si falla, devolvemos un tiempo muy alto
+    return 9999.0
 
 def procesar_tablas_inteligente(pdf_bytes, curso):
     data_to_insert = []
-    current_year = "2025"
+    current_year = str(datetime.datetime.now().year) # Año actual dinámico
     
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         print(f"   📄 Analizando PDF ({curso})...")
@@ -67,44 +126,29 @@ def procesar_tablas_inteligente(pdf_bytes, curso):
             tables = page.extract_tables()
             if not tables: continue
             
-            # --- ESTRATEGIA: BIOLOGÍA VS TEXTO ---
-            # Si hay 2 tablas en la página, aplicamos la Ley de Velocidad
-            mapa_generos = {} # {indice_tabla: 'M' o 'F'}
+            mapa_generos = {} 
             
             if len(tables) >= 2:
-                t0_testigo = extraer_tiempo_testigo(tables[0])
-                t1_testigo = extraer_tiempo_testigo(tables[1])
+                t0 = extraer_tiempo_testigo(tables[0])
+                t1 = extraer_tiempo_testigo(tables[1])
                 
-                print(f"      🥊 Comparando velocidades: Tabla 0 ({t0_testigo}s) vs Tabla 1 ({t1_testigo}s)")
+                print(f"      🥊 Comparando: Tabla 0 ({t0}s) vs Tabla 1 ({t1}s)")
                 
-                if t0_testigo < t1_testigo and t0_testigo > 0:
-                    mapa_generos[0] = 'M'
-                    mapa_generos[1] = 'F'
-                    print("      ✅ Conclusión: Tabla 0 es HOMBRES (Más rápido)")
-                elif t1_testigo < t0_testigo and t1_testigo > 0:
-                    mapa_generos[0] = 'F'
-                    mapa_generos[1] = 'M'
-                    print("      ✅ Conclusión: Tabla 0 es MUJERES (Más lento)")
+                if t0 < t1 and t0 > 0:
+                    mapa_generos[0], mapa_generos[1] = 'M', 'F'
+                elif t1 < t0 and t1 > 0:
+                    mapa_generos[0], mapa_generos[1] = 'F', 'M'
                 else:
-                    print("      ⚠️ No se pudo determinar por velocidad. Usando orden por defecto.")
-                    mapa_generos[0] = 'F'
-                    mapa_generos[1] = 'M'
+                    mapa_generos[0], mapa_generos[1] = 'F', 'M' 
             else:
-                # Si hay solo 1 tabla, buscamos texto en la página
                 page_text = page.extract_text().upper()
-                if "WOMEN" in page_text and "MEN" not in page_text:
-                    mapa_generos[0] = 'F'
-                elif "MEN" in page_text and "WOMEN" not in page_text:
-                    mapa_generos[0] = 'M'
-                else:
-                    mapa_generos[0] = 'F' # Default conservador
+                if "WOMEN" in page_text and "MEN" not in page_text: mapa_generos[0] = 'F'
+                elif "MEN" in page_text and "WOMEN" not in page_text: mapa_generos[0] = 'M'
+                else: mapa_generos[0] = 'F' 
             
-            # --- PROCESAMIENTO ---
             for i, table in enumerate(tables):
-                genero = mapa_generos.get(i, 'X') # 'X' si falló todo (para auditar)
+                genero = mapa_generos.get(i, 'X')
                 
-                # (Aquí va la misma lógica de extracción de filas que ya tenías)
-                # ... Lógica de cabecera ...
                 header_idx = -1
                 age_groups = []
                 for idx_row, row in enumerate(table):
@@ -123,7 +167,6 @@ def procesar_tablas_inteligente(pdf_bytes, curso):
                     event_name = str(row[0]).replace('\n', ' ').strip()
                     if not event_name or "RELAY" in event_name.upper(): continue
                     
-                    # Parsing Evento
                     parts = event_name.split()
                     if not parts[0].isdigit(): continue
                     distancia = int(parts[0])
@@ -136,7 +179,6 @@ def procesar_tablas_inteligente(pdf_bytes, curso):
                     elif "FLY" in estilo_raw: estilo = "Mariposa"
                     elif "IM" in estilo_raw: estilo = "Combinado"
                     
-                    # Parsing Tiempos
                     for col_idx, time_val in enumerate(row):
                         if col_idx == 0: continue
                         if col_idx >= len(age_groups): break
@@ -158,11 +200,16 @@ def procesar_tablas_inteligente(pdf_bytes, curso):
                                 "standard_type": "MASTERS",
                                 "season_year": current_year
                             })
+                            # Estadísticas de extracción
+                            STATS["extracted"] += 1
+                            if genero == 'M': STATS["male"] += 1
+                            elif genero == 'F': STATS["female"] += 1
 
     return data_to_insert
 
 def ejecutar_cazador():
-    print("🦈 Iniciando Cazador de Masters USMS v3.0 (Check de Velocidad)...")
+    print("🦈 Iniciando Cazador de Masters USMS v4.0 (Con Reporte Email)...")
+    # URL 2025
     pdf_url = "https://www-usms-hhgdctfafngha6hr.z01.azurefd.net/-/media/usms/pdfs/pool%20national%20championships/2025%20spring%20nationals/2025%20usms%20spring%20nationals%20nqts%20v2.pdf"
     
     try:
@@ -170,17 +217,10 @@ def ejecutar_cazador():
         if response.status_code == 200:
             datos = procesar_tablas_inteligente(response.content, "SCY")
             
-            # Filtro de seguridad: Si quedó alguna 'X', avisamos
-            sin_genero = [d for d in datos if d['genero'] == 'X']
-            if sin_genero:
-                print(f"⚠️ ALERTA: {len(sin_genero)} registros no pudieron clasificarse (Género X).")
-            
-            print(f"✅ Se extrajeron {len(datos)} registros clasificados.")
-            
             if datos:
-                # Borrón y cuenta nueva de los masters para evitar duplicados
+                # Borrado masivo anterior
                 supabase.table("standards_usa").delete().eq("standard_type", "MASTERS").execute()
-                print("🗑️  Limpieza de datos Masters anteriores completada.")
+                print("🗑️  Datos antiguos eliminados.")
 
                 # Inserción
                 batch_size = 100
@@ -189,8 +229,29 @@ def ejecutar_cazador():
                     batch = datos[i:i+batch_size]
                     supabase.table("standards_usa").insert(batch).execute()
                     print(f"   💉 Inyectado lote {i} a {min(i+batch_size, total)}")
+                
+                STATS["inserted"] = total
+                
+                # Generar Log Final para el Email
+                log_final = f"[USMS_MASTERS] Extracted={STATS['extracted']} | Inserted={STATS['inserted']} | Male={STATS['male']} | Female={STATS['female']} | Errors={STATS['errors']}"
+                print("\n" + log_final)
+                
+                # Enviar Email
+                enviar_reporte_email(log_final, "SUCCESS")
+                
+            else:
+                STATS['errors'] += 1
+                enviar_reporte_email("No data extracted from PDF", "FAILURE")
+        else:
+            STATS['errors'] += 1
+            error_msg = f"HTTP Error {response.status_code}"
+            print(error_msg)
+            enviar_reporte_email(error_msg, "FAILURE")
+            
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        STATS['errors'] += 1
+        print(f"⚠️ Error crítico: {e}")
+        enviar_reporte_email(f"Critical Exception: {str(e)}", "FAILURE")
 
 if __name__ == "__main__":
     ejecutar_cazador()
