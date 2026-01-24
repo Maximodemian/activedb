@@ -38,7 +38,7 @@ except ModuleNotFoundError:
 
 # -------------------------- Config --------------------------
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM+ARG_v15.3_STABLE_XLSX_MARKED_2026-01-24")
+MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM+ARG_v15.4_STABLE_XLSX_MARKED_2026-01-24")
 RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -69,7 +69,12 @@ WA_INCLUDE_MIXED = os.getenv("WA_INCLUDE_MIXED", "0").strip() == "1"
 # Fuentes Wiki (estables)
 WIKI_SUDAM_URL = "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Sudam%C3%A9rica_de_nataci%C3%B3n"
 WIKI_PANAM_GAMES_URL = "https://en.wikipedia.org/wiki/List_of_Pan_American_Games_records_in_swimming"
-WIKI_ARG_URL = "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Argentina_de_nataci%C3%B3n"
+WIKI_ARG_URLS = [
+    "https://es.wikipedia.org/wiki/R%C3%A9cords_argentinos_absolutos_de_nataci%C3%B3n",
+    "https://en.wikipedia.org/wiki/List_of_Argentine_records_in_swimming",
+    "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Argentina_de_nataci%C3%B3n",  # fallback histórico
+]
+
 
 # Fuentes ARG (estrategia)
 SWIMCLOUD_ARG_RECORDS_URL = "https://www.swimcloud.com/country/arg/records/"
@@ -849,12 +854,15 @@ def run_arg_records(sb: SB) -> Dict[str, int]:
     stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
 
     env_urls = [u.strip() for u in os.getenv("ARG_URLS", "").split(",") if u.strip()]
-    urls = env_urls or [WIKI_ARG_URL]
+    urls = env_urls or WIKI_ARG_URLS
 
     total_rows = 0
     for url in urls:
         try:
             rows = wiki_parse_records(url, default_pool="LCM", default_gender=None)
+            if not rows:
+                print(f"⚠️ ARG WIKI sin tablas/filas parseables | {url}")
+                continue
             total_rows += len(rows)
             print(f"🇦🇷 ARG source=WIKI filas={len(rows)} | {url}")
         except Exception as e:
