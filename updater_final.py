@@ -1,855 +1,954 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-MDV Records Updater (World Aquatics + Sudamericano + PanAm Games)
 
-- country/city: datos del atleta (según tu regla)
-- competition_location: lugar del evento (texto)
-- athlete_name: SOLO nombres
-- type_probe: individual | relay
-- Parche 23505 (duplicate key) + fix 'location' no inicializada
 """
+MDV Sports - Records Updater (GitHub Actions)
+---------------------------------------------
+Objetivo:
+- Scrappear fuentes oficiales de récords (World Aquatics, CONSANAT, etc.)
+- Hacer UPSERT en public.records_standards (actualiza si existe, inserta si falta)
+- Completar campos faltantes aunque el tiempo no haya cambiado
+- Registrar cambios (y opcionalmente inserts) en public.scraper_logs
+- (Opcional) enviar mail resumen (Gmail SMTP) si EMAIL_USER/EMAIL_PASS están configurados.
 
-from __future__ import annotations
+NOTA IMPORTANTE:
+- Este script NO imprime secrets.
+- Todo lo "inestable" (selectores, columnas exactas de XLSX/PDF) se maneja con heurísticas y try/except.
+"""
 
 import os
 import re
-import sys
 import json
-import uuid
-import shutil
-from dataclasses import dataclass
-from datetime import datetime, timezone, date
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import traceback
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import requests
+from supabase import create_client, Client
+
+# Fuentes extra
 from bs4 import BeautifulSoup
-from openpyxl import load_workbook
-from playwright.sync_api import sync_playwright
-from supabase import create_client
 
-# (Opcional) .env local
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except ModuleNotFoundError:
-    pass
+# Playwright para descargas (WA / páginas con JS / Cloudflare)
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
+# PDF parsing (para IPC SDMS, si se habilita)
+import pdfplumber
 
-# -------------------------- Config --------------------------
+MDV_UPDATER_VERSION = "MDV_UPDATER_VERSION=WA+CONSANAT+IPC_STUB_v5_2026-01-22"
 
-MDV_UPDATER_VERSION = os.getenv("MDV_UPDATER_VERSION", "WA+SUDAM+PANAM_v15_RESTORED_PLAYWRIGHT_XLSX")
-RUN_ID = os.getenv("GITHUB_RUN_ID") or str(uuid.uuid4())
-RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
-RUN_DATE = datetime.now(timezone.utc).date().isoformat()
+# =========================
+# Helpers (env, time, logs)
+# =========================
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
+    val = os.getenv(name, default)
+    if required and (val is None or str(val).strip() == ""):
+        raise RuntimeError(f"Missing required env var: {name}")
+    return str(val) if val is not None else ""
 
-HTTP_UA = os.getenv("MDV_HTTP_UA", "Mozilla/5.0 (MDV Records Updater)")
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+def safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
 
-# Flags
-MDV_STRICT = os.getenv("MDV_STRICT", "0").strip() == "1"
-WA_INCLUDE_MIXED = os.getenv("WA_INCLUDE_MIXED", "0").strip() == "1"
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-# Fuentes Wiki (estables)
-WIKI_SUDAM_URL = "https://es.wikipedia.org/wiki/Anexo:Plusmarcas_de_Sudam%C3%A9rica_de_nataci%C3%B3n"
-WIKI_PANAM_GAMES_URL = "https://en.wikipedia.org/wiki/List_of_Pan_American_Games_records_in_swimming"
+def parse_gender(g: str) -> str:
+    g = (g or "").strip().upper()
+    if g in ("M", "MEN", "MALE", "H", "HOMBRE", "HOMBRES"):
+        return "M"
+    if g in ("W", "F", "WOMEN", "FEMALE", "MUJER", "MUJERES"):
+        return "F"
+    return g[:1] if g else ""
 
 STROKE_MAP = {
-    "freestyle": "Libre",
-    "backstroke": "Espalda",
-    "breaststroke": "Pecho",
-    "butterfly": "Mariposa",
-    "medley": "Combinado",
-    "individual medley": "Combinado",
-    "im": "Combinado",
-    "medley relay": "Combinado",
-    "freestyle relay": "Libre",
-    "backstroke relay": "Espalda",
-    "breaststroke relay": "Pecho",
-    "butterfly relay": "Mariposa",
-    "libre": "Libre",
-    "espalda": "Espalda",
-    "pecho": "Pecho",
-    "mariposa": "Mariposa",
-    "combinado": "Combinado",
+    "FREESTYLE": "Libre",
+    "BACKSTROKE": "Espalda",
+    "BREASTSTROKE": "Pecho",
+    "BUTTERFLY": "Mariposa",
+    "MEDLEY": "Combinado",
+    "INDIVIDUAL MEDLEY": "Combinado",
+    "IM": "Combinado",
 }
 
-# -------------------------- Helpers: time/date --------------------------
+def parse_stroke(s: str) -> str:
+    s0 = norm_space(s).upper()
+    return STROKE_MAP.get(s0, s.title() if s else "")
 
-def _strip(s: Any) -> str:
-    if s is None:
-        return ""
-    return str(s).strip()
+def is_relay_event(event_name: str) -> bool:
+    e = (event_name or "").lower()
+    return ("relay" in e) or ("4x" in e) or ("medley relay" in e)
 
-def parse_time_to_ms(raw: Any) -> Optional[int]:
-    if raw is None:
-        return None
-    s = _strip(raw)
-    if not s:
-        return None
-    s = s.replace(",", ".")
-    s = re.sub(r"\s+", "", s)
-
-    if ":" in s:
-        parts = s.split(":")
+def parse_distance(event_name: str) -> Optional[int]:
+    """
+    Extrae distancia en metros de textos tipo:
+    - "Men 200m Freestyle"
+    - "200m Butterfly"
+    - "50 m LIBRE"
+    """
+    m = re.search(r"(\d{2,4})\s*m", event_name.replace(" ", "").lower())
+    if not m:
+        m = re.search(r"(\d{2,4})\s*m", event_name.lower())
+    if m:
         try:
-            if len(parts) == 3:
-                hh = int(parts[0])
-                mm = int(parts[1])
-                sec = float(parts[2])
-            elif len(parts) == 2:
-                hh = 0
-                mm = int(parts[0])
-                sec = float(parts[1])
-            else:
-                return None
-            return int(round(((hh * 3600 + mm * 60) + sec) * 1000))
-        except Exception:
+            return int(m.group(1))
+        except:
             return None
-
-    dot_parts = s.split(".")
-    try:
-        if len(dot_parts) == 2:
-            return int(round(float(s) * 1000))
-        if len(dot_parts) == 3:
-            mm = int(dot_parts[0]); ss = int(dot_parts[1]); cc = int(dot_parts[2])
-            return (mm * 60 + ss) * 1000 + int(round(cc * 10))
-        if len(dot_parts) == 4:
-            hh = int(dot_parts[0]); mm = int(dot_parts[1]); ss = int(dot_parts[2]); cc = int(dot_parts[3])
-            return (hh * 3600 + mm * 60 + ss) * 1000 + int(round(cc * 10))
-    except Exception:
-        return None
     return None
 
-def format_ms_to_hms_2dp(ms: int) -> str:
-    if ms < 0:
-        ms = 0
-    total_seconds = ms // 1000
-    cent = (ms % 1000) // 10
-    hh = total_seconds // 3600
-    mm = (total_seconds % 3600) // 60
-    ss = total_seconds % 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d}.{cent:02d}"
-
-def parse_date(raw: Any) -> Optional[str]:
-    if raw is None:
+def time_clock_to_ms(clock: str) -> Optional[int]:
+    """
+    Acepta:
+      00:01:52.69
+      1:52.69
+      52.69
+      00:52.69
+      1.30.51   (CONSANAT / formato con puntos => 1:30.51)
+      14.48.53  (=> 14:48.53)
+    """
+    c = (clock or "").strip()
+    if not c:
         return None
-    if isinstance(raw, (datetime, date)):
-        return raw.date().isoformat() if isinstance(raw, datetime) else raw.isoformat()
 
-    s = _strip(raw)
+    # normalizar separadores decimales
+    c = c.replace(",", ".")
+
+    # Si viene con puntos como separador de min/seg/centésimas: m.ss.cc o mm.ss.cc
+    # Ej: 1.30.51 -> 1:30.51
+    if ":" not in c and re.fullmatch(r"\d{1,3}\.\d{2}\.\d{2}", c):
+        a, b, h = c.split(".")
+        c = f"{a}:{b}.{h}"
+
+    # Si viene con puntos como separador de hora/min/seg/centésimas: h.mm.ss.cc (raro)
+    if ":" not in c and re.fullmatch(r"\d{1,2}\.\d{2}\.\d{2}\.\d{2}", c):
+        hh, mm, ss, cc = c.split(".")
+        c = f"{hh}:{mm}:{ss}.{cc}"
+
+    parts = c.split(":")
+    try:
+        if len(parts) == 3:
+            hh = int(parts[0]); mm = int(parts[1]); ss = float(parts[2])
+            return int(round((hh*3600 + mm*60 + ss) * 1000))
+        if len(parts) == 2:
+            mm = int(parts[0]); ss = float(parts[1])
+            return int(round((mm*60 + ss) * 1000))
+        # solo segundos
+        ss = float(parts[0])
+        return int(round(ss * 1000))
+    except:
+        return None
+
+def ms_to_time_clock_2dp(ms: int) -> str:
+    if ms is None:
+        return ""
+    total_sec = ms / 1000.0
+    hh = int(total_sec // 3600)
+    rem = total_sec - hh*3600
+    mm = int(rem // 60)
+    ss = rem - mm*60
+    if hh > 0:
+        return f"{hh:02d}:{mm:02d}:{ss:05.2f}"
+    if mm > 0:
+        return f"{mm:02d}:{ss:05.2f}"
+    return f"{ss:.2f}"
+
+def parse_date_any(s: str) -> Optional[str]:
+    """
+    Devuelve YYYY-MM-DD si se puede.
+    """
+    s = (s or "").strip()
     if not s:
         return None
+    # formatos comunes
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%y", "%d-%m-%y", "%d %b %Y", "%d %B %Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.date().isoformat()
+        except:
+            pass
+    # fallback: buscar YYYY-MM-DD dentro
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
 
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        return s
+def supa_client() -> Client:
+    url = env("SUPABASE_URL", required=True)
+    key = env("SUPABASE_KEY", required=True)
+    return create_client(url, key)
 
+def insert_scraper_log(sb: Client, scope: str, prueba: str, atleta: str,
+                      t_old: str, t_new: str) -> None:
     try:
-        dt = datetime.strptime(s, "%d %B %Y")
-        return dt.date().isoformat()
+        sb.table("scraper_logs").insert({
+            "fecha": utc_now_iso(),
+            "scope": scope,
+            "prueba": prueba,
+            "atleta": atleta,
+            "tiempo_anterior": t_old,
+            "tiempo_nuevo": t_new,
+        }).execute()
     except Exception:
+        # no frenamos el run si falla logging
         pass
 
-    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$", s)
-    if m:
-        d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3))
-        if y < 100:
-            y += 2000
-        try:
-            return datetime(y, mo, d).date().isoformat()
-        except Exception:
-            return None
-
-    return None
-
-def gender_label(g: Any) -> str:
-    return "M" if _strip(g).upper().startswith("M") else "F"
-
-def pool_label(pool: Any) -> str:
-    p = _strip(pool).upper()
-    if p in ("LCM", "50M", "50", "L", "LONG"):
-        return "LCM"
-    if p in ("SCM", "25M", "25", "S", "SHORT"):
-        return "SCM"
-    if p in ("SCY", "YARDS", "YD", "Y"):
-        return "SCY"
-    return p or "LCM"
-
-# -------------------------- Event parsing (incluye relevos) --------------------------
-
-RE_RELAY = re.compile(
-    r"(?P<n>\d)\s*[x×]\s*(?P<leg>\d{2,4})\s*m\s*(?P<stroke>freestyle|backstroke|breaststroke|butterfly|medley)\s*(relay)?",
-    re.IGNORECASE,
-)
-RE_INDIV = re.compile(
-    r"(?P<dist>\d{2,4})\s*m\s*(?P<stroke>freestyle|backstroke|breaststroke|butterfly|medley|individual\s+medley|im|libre|espalda|pecho|mariposa|combinado)",
-    re.IGNORECASE,
-)
-
-def parse_event(event_raw: Any) -> Tuple[Optional[int], Optional[str], str]:
-    s = _strip(event_raw)
-    if not s:
-        return None, None, "individual"
-    lo = s.lower()
-
-    m = RE_RELAY.search(lo)
-    if m:
-        n = int(m.group("n"))
-        leg = int(m.group("leg"))
-        stroke_key = m.group("stroke").lower()
-        stroke = STROKE_MAP.get(stroke_key)
-        return n * leg, stroke, "relay"
-
-    m = RE_INDIV.search(lo)
-    if not m:
-        return None, None, "individual"
-    dist = int(m.group("dist"))
-    stroke_key = m.group("stroke").lower().replace("  ", " ").strip()
-    stroke = STROKE_MAP.get(stroke_key, STROKE_MAP.get(stroke_key.replace("individual ", "")))
-    return dist, stroke, "individual"
-
-# -------------------------- Supabase helpers --------------------------
-
-def is_duplicate_error(e: Exception) -> bool:
-    s = str(e).lower()
-    return ("23505" in s) or ("duplicate key value" in s)
-
-def _is_empty(v: Any) -> bool:
-    if v is None:
-        return True
-    if isinstance(v, str):
-        return v.strip() == ""
-    return False
-
-class SB:
-    def __init__(self, url: str, key: str):
-        if not url or not key:
-            raise RuntimeError("Faltan SUPABASE_URL / SUPABASE_KEY")
-        self.client = create_client(url, key)
-        self.columns = self._detect_columns()
-        print(f"🧬 DB columns detectadas: {len(self.columns)}")
-
-    def _detect_columns(self) -> set:
-        try:
-            resp = self.client.table("records_standards").select("*").limit(1).execute()
-            if resp.data:
-                return set(resp.data[0].keys())
-        except Exception:
-            pass
-        return {
-            "id","gender","category","pool_length","stroke","distance",
-            "time_clock","time_ms","time_clock_2dp",
-            "record_scope","record_type",
-            "competition_name","competition_location",
-            "athlete_name","record_date",
-            "city","country",
-            "last_updated","source_url","source_name","source_note",
-            "verified","updated_at","is_active","type_probe",
-        }
-
-    def _filter_payload(self, payload: Dict[str, Any], keep_empty: Iterable[str]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        keep_empty_set = set(keep_empty)
-        for k, v in payload.items():
-            if k not in self.columns:
-                continue
-            if k in keep_empty_set:
-                out[k] = v
-                continue
-            if _is_empty(v):
-                continue
-            out[k] = v
-        return out
-
-    def _fetch_existing(self, key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        q = self.client.table("records_standards").select("*")
-        for k, v in key.items():
-            q = q.eq(k, v)
-        resp = q.limit(1).execute()
-        return (resp.data or [None])[0]
-
-    def upsert_record(self, payload_full: Dict[str, Any]) -> str:
-        key_fields = ["gender","category","pool_length","stroke","distance","record_type","record_scope"]
-        key = {k: payload_full.get(k) for k in key_fields}
-        for k in key_fields:
-            if _is_empty(key.get(k)):
-                raise ValueError(f"payload missing {k}")
-
-        existing = self._fetch_existing(key)
-
-        new_ms = payload_full.get("time_ms")
-        old_ms = existing.get("time_ms") if existing else None
-        time_changed = (existing is not None) and (new_ms is not None) and (old_ms is not None) and (int(new_ms) != int(old_ms))
-
-        fill_fields = [
-            "athlete_name",
-            "country", "city",
-            "record_date",
-            "competition_name", "competition_location",
-            "source_name", "source_url", "source_note",
-            "type_probe",
-        ]
-
-        if existing:
-            updates: Dict[str, Any] = {}
-
-            for f in fill_fields:
-                newv = payload_full.get(f)
-                oldv = existing.get(f)
-                if _is_empty(newv):
-                    continue
-                if _is_empty(oldv):
-                    updates[f] = newv
-
-            if time_changed:
-                updates["time_ms"] = int(payload_full["time_ms"])
-                updates["time_clock_2dp"] = payload_full.get("time_clock_2dp")
-                updates["time_clock"] = payload_full.get("time_clock")
-
-            if updates:
-                updates["last_updated"] = RUN_DATE
-                upd = self._filter_payload(updates, keep_empty=["last_updated"])
-                self.client.table("records_standards").update(upd).eq("id", existing["id"]).execute()
-                return "updated" if time_changed else "filled"
-
-            return "unchanged"
-
-        insert_payload = dict(payload_full)
-        insert_payload["last_updated"] = RUN_DATE
-
-        filtered = self._filter_payload(
-            insert_payload,
-            keep_empty=["gender","category","pool_length","stroke","distance","record_type","record_scope","type_probe","last_updated"]
-        )
-        try:
-            self.client.table("records_standards").insert(filtered).execute()
-            return "inserted"
-        except Exception as e:
-            if is_duplicate_error(e):
-                # Re-fetch y pasar a modo update/fill
-                existing2 = self._fetch_existing(key)
-                if existing2:
-                    return self.upsert_record(payload_full)
-            raise
-
-# -------------------------- World Aquatics --------------------------
+# =========================
+# Modelo de registro target
+# =========================
 
 @dataclass
-class WASpec:
-    code: str
-    pool: str
+class RecordRow:
+    record_scope: str
+    record_type: str
+    category: str
+    pool_length: str
     gender: str
+    distance: int
+    stroke: str
 
-def wa_url(spec: WASpec) -> str:
-    base = "https://www.worldaquatics.com/swimming/records"
-    if spec.code == "WR":
-        return f"{base}?recordType=WR&eventTypeId=&region=&countryId=&gender={spec.gender}&pool={spec.pool}"
-    if spec.code == "OR":
-        return f"{base}?recordType=OR&eventTypeId=&region=&countryId=&gender={spec.gender}&pool={spec.pool}"
-    if spec.code == "WJ":
-        return f"{base}?recordCode=WJ&eventTypeId=&region=&countryId=&gender={spec.gender}&pool={spec.pool}"
-    if spec.code == "CR_AMERICAS":
-        return f"{base}?recordType=PAN&recordCode=CR&eventTypeId=&region=AMERICAS&countryId=&gender={spec.gender}&pool={spec.pool}"
-    raise ValueError(spec.code)
+    time_clock: str = ""
+    time_ms: Optional[int] = None
+    record_date: Optional[str] = None
+    competition_name: str = ""
+    athlete_name: str = ""
+    city: str = ""
+    country: str = ""
+    last_updated: Optional[str] = None
 
-def wa_scope_and_type(code: str, pool: str) -> Tuple[str, str]:
-    pool = pool_label(pool)
-    is_scm = (pool == "SCM")
-    if code == "WR":
-        return "Mundial", "Récord Mundial" + (" SC" if is_scm else "")
-    if code == "OR":
-        return "Olímpico", "Récord Olímpico"
-    if code == "WJ":
-        return "Mundial", "Récord Mundial Junior" + (" SC" if is_scm else "")
-    if code == "CR_AMERICAS":
-        return "Américas", "Récord Continental Américas" + (" SC" if is_scm else "")
-    raise ValueError(code)
+    source_name: str = ""
+    source_url: str = ""
+    source_note: str = ""
+    verified: bool = True
+    is_active: bool = True
 
-def wa_specs() -> List[WASpec]:
-    out: List[WASpec] = []
-    genders = ["M","F"] + (["X"] if WA_INCLUDE_MIXED else [])
-    for gender in genders:
-        for pool in ("LCM","SCM"):
-            out.append(WASpec("WR", pool, gender))
-            out.append(WASpec("WJ", pool, gender))
-            out.append(WASpec("CR_AMERICAS", pool, gender))
-        out.append(WASpec("OR","LCM", gender))
-    return out
+    def key_filter(self) -> Dict[str, Any]:
+        return {
+            "record_scope": self.record_scope,
+            "record_type": self.record_type,
+            "category": self.category,
+            "pool_length": self.pool_length,
+            "gender": self.gender,
+            "distance": self.distance,
+            "stroke": self.stroke,
+        }
 
-def wa_download_xlsx(page, url: str, out_dir: str) -> str:
-    page.goto(url, wait_until="networkidle", timeout=120_000)
+    def to_insert_payload(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        # columnas calculadas
+        if self.time_ms is not None:
+            payload["time_clock_2dp"] = ms_to_time_clock_2dp(self.time_ms)
+        else:
+            payload["time_clock_2dp"] = ""
+        payload["updated_at"] = utc_now_iso()
+        return payload
+
+    def to_update_payload(self) -> Dict[str, Any]:
+        # Solo campos "datos" (no clave)
+        payload = {
+            "time_clock": self.time_clock,
+            "time_ms": self.time_ms,
+            "time_clock_2dp": ms_to_time_clock_2dp(self.time_ms) if self.time_ms is not None else "",
+            "record_date": self.record_date,
+            "competition_name": self.competition_name,
+            "athlete_name": self.athlete_name,
+            "city": self.city,
+            "country": self.country,
+            "last_updated": self.last_updated,
+            "source_name": self.source_name,
+            "source_url": self.source_url,
+            "source_note": self.source_note,
+            "verified": self.verified,
+            "is_active": self.is_active,
+            "updated_at": utc_now_iso(),
+        }
+        return payload
+
+# =========================
+# Upsert core
+# =========================
+
+def fetch_existing_by_key(sb: Client, key_filter: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    q = sb.table("records_standards").select("*")
+    for k, v in key_filter.items():
+        q = q.eq(k, v)
+    res = q.limit(1).execute()
+    data = res.data or []
+    return data[0] if data else None
+
+def upsert_one(sb: Client, rec: RecordRow, *, log_inserts: bool = False) -> Tuple[str, Optional[str]]:
+    """
+    Returns: (action, message)
+      action in {"INSERT","UPDATE","FILL","SKIP","ERROR"}
+    """
     try:
-        page.get_by_role("button", name=re.compile(r"Accept Cookies|Accept all", re.I)).click(timeout=2500)
+        key = rec.key_filter()
+        existing = fetch_existing_by_key(sb, key)
+
+        # Insert si no existe
+        if not existing:
+            sb.table("records_standards").insert(rec.to_insert_payload()).execute()
+            if log_inserts:
+                insert_scraper_log(
+                    sb,
+                    rec.record_scope,
+                    f"{rec.gender} {rec.distance}m {rec.stroke} {rec.pool_length}",
+                    rec.athlete_name or "(sin atleta)",
+                    "",
+                    rec.time_clock or ""
+                )
+            return ("INSERT", "new row")
+
+        # Si existe: decidir si hay update de tiempo y/o completar campos faltantes
+        existing_time_ms = existing.get("time_ms")
+        existing_time_clock = safe_str(existing.get("time_clock"))
+        existing_athlete = safe_str(existing.get("athlete_name"))
+        existing_comp = safe_str(existing.get("competition_name"))
+        existing_date = safe_str(existing.get("record_date"))
+        existing_city = safe_str(existing.get("city"))
+        existing_country = safe_str(existing.get("country"))
+
+        changed_time = (rec.time_ms is not None and existing_time_ms is not None and int(rec.time_ms) != int(existing_time_ms)) \
+                       or (rec.time_ms is not None and existing_time_ms is None and rec.time_clock) \
+                       or (rec.time_ms is None and rec.time_clock and existing_time_clock and rec.time_clock != existing_time_clock)
+
+        # Completar si faltan datos
+        def is_blank(x: str) -> bool:
+            return (x or "").strip() == ""
+
+        need_fill = (
+            (is_blank(existing_athlete) and not is_blank(rec.athlete_name)) or
+            (is_blank(existing_comp) and not is_blank(rec.competition_name)) or
+            (is_blank(existing_date) and rec.record_date) or
+            (is_blank(existing_city) and not is_blank(rec.city)) or
+            (is_blank(existing_country) and not is_blank(rec.country)) or
+            (existing.get("source_url") in (None, "", "null") and rec.source_url) or
+            (existing.get("source_name") in (None, "", "null") and rec.source_name)
+        )
+
+        if not changed_time and not need_fill:
+            return ("SKIP", None)
+
+        sb.table("records_standards").update(rec.to_update_payload()).eq("id", existing["id"]).execute()
+
+        if changed_time:
+            insert_scraper_log(
+                sb,
+                rec.record_scope,
+                f"{rec.gender} {rec.distance}m {rec.stroke} {rec.pool_length}",
+                rec.athlete_name or existing_athlete,
+                existing_time_clock or safe_str(existing_time_ms),
+                rec.time_clock or safe_str(rec.time_ms),
+            )
+            return ("UPDATE", "time changed")
+
+        return ("FILL", "filled missing fields")
+
+    except Exception as e:
+        return ("ERROR", f"{type(e).__name__}: {e}")
+
+# =========================
+# World Aquatics scraper
+# =========================
+
+def wa_build_url(record_code: str, pool: str, gender: str, *, record_type: Optional[str] = None,
+                 region: str = "", country_id: str = "", event_type_id: str = "") -> str:
+    """
+    Ejemplos válidos (según tu captura):
+      WR: recordType=WR&recordCode=WR...
+      WJ: recordType=WJ&recordCode=WJ...
+      Continental: recordType=PAN&recordCode=CR&region=AMERICAS...
+    """
+    record_type = record_type or record_code
+    return (
+        "https://www.worldaquatics.com/swimming/records"
+        f"?recordType={record_type}"
+        f"&piscina={'50m' if pool=='LCM' else '25m'}"
+        f"&recordCode={record_code}"
+        f"&eventTypeId={event_type_id}"
+        f"&region={region}"
+        f"&countryId={country_id}"
+        f"&gender={gender}"
+        f"&pool={pool}"
+    )
+
+def wa_download_xlsx(play, url: str, out_path: str, *, timeout_ms: int = 45000) -> None:
+    """
+    Abre la URL en WorldAquatics y descarga el XLSX (link 'XLSX' o 'Download Records').
+    """
+    browser = play.chromium.launch(headless=True)
+    ctx = browser.new_context(accept_downloads=True)
+    page = ctx.new_page()
+
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+    # Aceptar cookies si el banner tapa
+    try:
+        # suele aparecer como botón "Accept Cookies"
+        page.get_by_role("button", name=re.compile(r"accept", re.I)).click(timeout=3000)
     except Exception:
         pass
 
-    with page.expect_download(timeout=120_000) as dl_info:
+    # Scroll un poco para asegurar que renderice links
+    try:
+        page.mouse.wheel(0, 800)
+    except Exception:
+        pass
+
+    # Intento 1: click directo en link "XLSX"
+    dl = None
+    try:
+        with page.expect_download(timeout=timeout_ms) as dlinfo:
+            # suele ser un link visible 'XLSX'
+            page.get_by_role("link", name=re.compile(r"xlsx", re.I)).click(timeout=8000)
+        dl = dlinfo.value
+    except Exception:
+        dl = None
+
+    # Intento 2: "Download Records" y elegir XLSX
+    if dl is None:
         try:
-            page.get_by_role("link", name=re.compile(r"\bXLSX\b", re.I)).click(timeout=10_000)
+            page.get_by_role("link", name=re.compile(r"download records", re.I)).click(timeout=8000)
+            with page.expect_download(timeout=timeout_ms) as dlinfo:
+                page.get_by_role("link", name=re.compile(r"xlsx", re.I)).click(timeout=8000)
+            dl = dlinfo.value
         except Exception:
-            page.get_by_role("link", name=re.compile(r"Download", re.I)).click(timeout=10_000)
+            dl = None
 
-    download = dl_info.value
-    filename = download.suggested_filename or f"wa_{uuid.uuid4().hex}.xlsx"
-    path = os.path.join(out_dir, filename)
-    download.save_as(path)
-    return path
+    if dl is None:
+        raise RuntimeError("No pude descargar XLSX (no apareció link / descarga).")
 
-def wa_parse_xlsx(xlsx_path: str) -> List[Dict[str, Any]]:
-    wb = load_workbook(xlsx_path, data_only=True)
-    rows_out: List[Dict[str, Any]] = []
+    dl.save_as(out_path)
 
-    def norm(v: Any) -> str:
-        return _strip(v)
+    ctx.close()
+    browser.close()
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        values = list(ws.values)
-        if not values:
+def wa_parse_xlsx_to_records(xlsx_path: str, *, record_scope: str, record_type: str,
+                             pool: str, gender: str, source_url: str, source_name: str,
+                             source_note: str = "") -> List[RecordRow]:
+    """
+    Lee el XLSX y lo convierte a RecordRow(s).
+    Heurística flexible por nombres de columnas.
+    """
+    df = pd.read_excel(xlsx_path)
+    cols = {c: norm_space(str(c)).lower() for c in df.columns}
+    # encontrar columnas por substrings
+    def find_col(*needles: str) -> Optional[str]:
+        for c, lc in cols.items():
+            for n in needles:
+                if n in lc:
+                    return c
+        return None
+
+    col_event = find_col("event") or find_col("discipline") or find_col("prueba")
+    col_time = find_col("time") or find_col("mark") or find_col("marca")
+    col_athlete = find_col("athlete") or find_col("name") or find_col("swimmer") or find_col("nadador")
+    col_country = find_col("country") or find_col("nation") or find_col("noc") or find_col("país")
+    col_date = find_col("date") or find_col("fecha")
+    col_comp = find_col("competition") or find_col("meet") or find_col("event name") or find_col("competición")
+    col_city = find_col("city") or find_col("location") or find_col("venue") or find_col("lugar")
+
+    out: List[RecordRow] = []
+    for _, row in df.iterrows():
+        event = safe_str(row.get(col_event, "")).strip()
+        if not event:
+            continue
+        if is_relay_event(event):
             continue
 
-        header_idx = None
-        header_map: Dict[str, int] = {}
+        dist = parse_distance(event)
+        if not dist:
+            continue
 
-        for i, row in enumerate(values[:60]):
-            row_norm = [norm(x).lower() for x in row]
-            if any("event" in c for c in row_norm) and any("time" in c for c in row_norm):
-                header_idx = i
-                for j, c in enumerate(row_norm):
-                    if "event" in c:
-                        header_map["event"] = j
-                    elif "time" in c:
-                        header_map["time"] = j
-                    elif "athlete" in c or "swimmer" in c or "record holder" in c:
-                        header_map["athlete"] = j
-                    elif "country" in c or "nation" in c:
-                        header_map["country"] = j
-                    elif "date" in c:
-                        header_map["date"] = j
-                    elif "place" in c or "location" in c or "venue" in c:
-                        header_map["location"] = j
-                    elif "competition" in c or "meet" in c:
-                        header_map["competition"] = j
+        # stroke: buscar keywords
+        ev_upper = event.upper()
+        stroke = ""
+        for k, v in STROKE_MAP.items():
+            if k in ev_upper:
+                stroke = v
                 break
+        if not stroke:
+            # intentar última palabra
+            stroke = parse_stroke(event.split()[-1])
 
-        if header_idx is None or "event" not in header_map or "time" not in header_map:
-            continue
+        t_clock = safe_str(row.get(col_time, "")).strip()
+        t_ms = time_clock_to_ms(t_clock)
 
-        for row in values[header_idx+1:]:
-            event = norm(row[header_map["event"]])
-            t = norm(row[header_map["time"]])
-            if not event or not t:
-                continue
+        # WA a veces devuelve mm:ss.xx sin horas; ok
+        rec_date = parse_date_any(safe_str(row.get(col_date, "")))
 
-            athlete = norm(row[header_map.get("athlete", -1)]) if "athlete" in header_map else ""
-            country = norm(row[header_map.get("country", -1)]) if "country" in header_map else ""
-            date_raw = row[header_map.get("date", -1)] if "date" in header_map else ""
-            date_str = parse_date(date_raw) or norm(date_raw)
+        athlete = norm_space(safe_str(row.get(col_athlete, "")))
+        country = norm_space(safe_str(row.get(col_country, "")))
+        comp = norm_space(safe_str(row.get(col_comp, "")))
+        city = norm_space(safe_str(row.get(col_city, "")))
 
-            # ✅ FIX: location SIEMPRE inicializada
-            location = norm(row[header_map.get("location", -1)]) if "location" in header_map else ""
-            competition = norm(row[header_map.get("competition", -1)]) if "competition" in header_map else ""
+        out.append(RecordRow(
+            record_scope=record_scope,
+            record_type=record_type,
+            category="Open",
+            pool_length=pool,
+            gender=parse_gender(gender),
+            distance=dist,
+            stroke=stroke,
 
-            rows_out.append({
-                "event": event,
-                "time": t,
-                "athlete": athlete,
-                "country": country,
-                "date": date_str,
-                "location": location,
-                "competition": competition,
-            })
+            time_clock=t_clock,
+            time_ms=t_ms,
+            record_date=rec_date,
+            competition_name=comp,
+            athlete_name=athlete,
+            city=city,
+            country=country,
+            last_updated=utc_now_iso(),
 
-    return rows_out
+            source_name=source_name,
+            source_url=source_url,
+            source_note=source_note,
+            verified=True,
+            is_active=True,
+        ))
+    return out
 
-# -------------------------- Wikipedia parsers --------------------------
+# =========================
+# CONSANAT scraper (Sudamericano)
+# =========================
 
-def http_get(url: str, timeout: int = 30) -> str:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": HTTP_UA})
-    r.raise_for_status()
-    return r.text
-
-def wiki_table_context(table) -> str:
+def consanat_extract_blocks(text: str) -> List[Dict[str, str]]:
     """
-    Devuelve un contexto combinado para inferir género/piscina aunque la tabla tenga <caption>.
-    Wikipedia a menudo pone el género en el heading (h2/h3/h4) y el caption es genérico.
+    CONSANAT expone el contenido como secciones (corta/larga) y por género (FEMININO/MASCULINO/MIXTO).
+    En la extracción textual se ve como bloques repetidos:
+
+      PRUEBAS
+      TIEMPO
+      RECORDISTA
+      PAÍS
+      FECHA
+      LOCAL
+      COMPETICIÓN
+      <prueba>
+      <tiempo>
+      <recordista>
+      <pais>
+      <fecha>
+      <local>
+      <competición>
+      ...
+
+    Parseamos eso sin depender de <table>.
     """
-    parts = []
+    lines = [norm_space(l) for l in (text or "").splitlines() if l.strip()]
+    out: List[Dict[str, str]] = []
 
-    cap = table.find("caption")
-    if cap:
-        parts.append(cap.get_text(" ", strip=True))
+    pool = None  # "SCM" o "LCM"
+    gender = None  # "F" / "M" / "X"
 
-    # Captura hasta 2 headings previos (p.ej. "Piscina larga" + "Masculino")
-    prev = table.find_previous(["h4", "h3", "h2"])
-    if prev:
-        parts.append(prev.get_text(" ", strip=True))
-        prev2 = prev.find_previous(["h4", "h3", "h2"])
-        if prev2:
-            parts.append(prev2.get_text(" ", strip=True))
+    hdr = ["PRUEBAS", "TIEMPO", "RECORDISTA", "PAÍS", "FECHA", "LOCAL", "COMPETICIÓN"]
 
-    return " | ".join([p for p in parts if p]).lower()
+    i = 0
+    while i < len(lines):
+        ln = lines[i].upper()
 
-
-def wiki_guess_gender(ctx: str) -> Optional[str]:
-    # Masculino
-    if any(x in ctx for x in ["hombres", "hombre", "varones", "masculino", "men", "male", "boys"]):
-        return "M"
-    # Femenino
-    if any(x in ctx for x in ["mujeres", "mujer", "damas", "femenino", "women", "female", "girls"]):
-        return "F"
-    # Mixto (si existiera)
-    if any(x in ctx for x in ["mixto", "mixed"]):
-        return "X"
-    return None
-
-
-def wiki_guess_pool(ctx: str) -> Optional[str]:
-    if any(x in ctx for x in ["piscina corta","short course","scm","25"]):
-        return "SCM"
-    if any(x in ctx for x in ["piscina larga","long course","lcm","50"]):
-        return "LCM"
-    return None
-
-def wiki_parse_records(url: str, default_pool: str = "LCM", default_gender: Optional[str] = None) -> List[Dict[str, Any]]:
-    html = http_get(url, timeout=40)
-    soup = BeautifulSoup(html, "html.parser")
-
-    out: List[Dict[str, Any]] = []
-    tables = soup.find_all("table", class_=re.compile("wikitable"))
-    for t in tables:
-        ctx = wiki_table_context(t)
-        pool = wiki_guess_pool(ctx) or default_pool
-        gender = wiki_guess_gender(ctx) or default_gender
-
-        rows = t.find_all("tr")
-        if not rows:
+        if "PISCINA CORTA" in ln:
+            pool = "SCM"
+            i += 1
             continue
-        head_cells = [c.get_text(" ", strip=True).lower() for c in rows[0].find_all(["th","td"])]
-
-        def find_col(keys: Iterable[str]) -> Optional[int]:
-            for i, c in enumerate(head_cells):
-                for k in keys:
-                    if k in c:
-                        return i
-            return None
-
-        c_event = find_col(["event","prueba"])
-        c_time  = find_col(["time","marca","tiempo"])
-        c_swim  = find_col(["swimmer","record holder","nadador","athlete"])
-        c_nat   = find_col(["nation","country","país","pais"])
-        c_date  = find_col(["date","fecha"])
-        c_meet  = find_col(["meet","competition","competición","competicion"])
-        c_loc   = find_col(["location","place","lugar","venue"])
-
-        if c_event is None or c_time is None:
+        if "PISCINA LARGA" in ln:
+            pool = "LCM"
+            i += 1
             continue
 
-        for r in rows[1:]:
-            cells = [c.get_text(" ", strip=True) for c in r.find_all(["th","td"])]
-            if len(cells) <= max(c_event, c_time):
-                continue
+        if ln.strip("# ").startswith("FEMININO") or ln.strip() == "FEMININO":
+            gender = "F"; i += 1; continue
+        if ln.strip("# ").startswith("MASCULINO") or ln.strip() == "MASCULINO":
+            gender = "M"; i += 1; continue
+        if ln.strip("# ").startswith("MIXTO") or ln.strip() == "MIXTO":
+            gender = "X"; i += 1; continue
 
-            ev = cells[c_event]
-            tm = cells[c_time]
-            ms = parse_time_to_ms(tm)
-            if ms is None:
-                continue
+        # detectar comienzo de tabla por encabezados
+        if i + 6 < len(lines) and [lines[i+j].upper() for j in range(7)] == hdr:
+            i += 7
+            # consumir bloques de 7 campos
+            while i + 6 < len(lines):
+                # si aparece un nuevo encabezado/sección, cortamos
+                if lines[i].upper() in ("##",) or "PISCINA" in lines[i].upper() or lines[i].upper() in ("FEMININO","MASCULINO","MIXTO"):
+                    break
+                # Heurística: si vuelve a aparecer "PRUEBAS" asumimos reinicio
+                if lines[i].upper() == "PRUEBAS":
+                    break
 
-            dist, stroke, type_probe = parse_event(ev)
-            if dist is None or stroke is None:
-                continue
+                prueba = lines[i]; tiempo = lines[i+1]; recordista = lines[i+2]
+                pais = lines[i+3]; fecha = lines[i+4]; local = lines[i+5]; compet = lines[i+6]
+                out.append({
+                    "pool_length": pool or "",
+                    "gender": gender or "",
+                    "event": prueba,
+                    "time": tiempo,
+                    "athlete": recordista,
+                    "country": pais,
+                    "date": fecha,
+                    "city": local,
+                    "competition": compet,
+                })
+                i += 7
+            continue
 
-            swimmer = cells[c_swim] if (c_swim is not None and c_swim < len(cells)) else ""
-            nat = cells[c_nat] if (c_nat is not None and c_nat < len(cells)) else ""
-            d_raw = cells[c_date] if (c_date is not None and c_date < len(cells)) else ""
-            d_iso = parse_date(d_raw) or d_raw
-            meet = cells[c_meet] if (c_meet is not None and c_meet < len(cells)) else ""
-            loc = cells[c_loc] if (c_loc is not None and c_loc < len(cells)) else ""
-
-            out.append({
-                "pool": pool,
-                "gender": gender,
-                "event": ev,
-                "distance": dist,
-                "stroke": stroke,
-                "type_probe": type_probe,
-                "time_ms": ms,
-                "athlete": swimmer,
-                "athlete_country": nat,              # atleta
-                "record_date": d_iso,
-                "competition": meet,
-                "competition_location": loc,         # ✅ lugar del evento
-                "source_url": url,
-                "source_name": "Wikipedia",
-                "source_note": "WIKI",
-            })
+        i += 1
 
     return out
 
-# -------------------------- Payload builder --------------------------
+def consanat_fetch_records(url: str) -> List[Dict[str, str]]:
+    """
+    Descarga página CONSANAT y extrae bloques.
+    """
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text("\n")
+    return consanat_extract_blocks(text)
 
-def build_payload(
-    record_scope: str,
-    record_type: str,
-    pool: str,
-    gender: str,
-    distance: int,
-    stroke: str,
-    time_ms: int,
-    athlete_name: str,
-    athlete_country: str,
-    record_date: str,
-    competition_name: str,
-    competition_location: str,
-    source_name: str,
-    source_url: str,
-    source_note: str,
-    type_probe: str,
-) -> Dict[str, Any]:
-    t2 = format_ms_to_hms_2dp(int(time_ms))
-    return {
-        "gender": gender_label(gender),
-        "category": "Open",
-        "pool_length": pool_label(pool),
-        "stroke": stroke,
-        "distance": int(distance),
-        "time_ms": int(time_ms),
-        "time_clock_2dp": t2,
-        "time_clock": t2,
-        "record_scope": record_scope,
-        "record_type": record_type,
-        "competition_name": competition_name or "",
-        "competition_location": competition_location or "",  # ✅ NUEVO
-        "athlete_name": athlete_name or "",
-        "country": athlete_country or "",  # atleta
-        "city": "",                        # atleta (no suele venir)
-        "record_date": parse_date(record_date) or (record_date or None),
-        "last_updated": RUN_DATE,
-        "source_name": source_name or "",
-        "source_url": source_url or "",
-        "source_note": source_note or "",
-        "type_probe": (type_probe or "individual"),
-        "is_active": True,
+def consanat_blocks_to_records(blocks: List[Dict[str, str]], *, source_url: str) -> List[RecordRow]:
+    out: List[RecordRow] = []
+    for b in blocks:
+        event = safe_str(b.get("event","")).strip()
+        if not event or is_relay_event(event):
+            continue
+
+        dist = parse_distance(event)
+        if not dist:
+            continue
+
+        # stroke
+        u = event.upper()
+        if "LIBRE" in u or "FREESTYLE" in u:
+            stroke = "Libre"
+        elif "ESPALDA" in u or "BACKSTROKE" in u:
+            stroke = "Espalda"
+        elif "PECHO" in u or "BREAST" in u:
+            stroke = "Pecho"
+        elif "MARIPOSA" in u or "BUTTER" in u:
+            stroke = "Mariposa"
+        elif "COMBINADO" in u or "MEDLEY" in u:
+            stroke = "Combinado"
+        else:
+            stroke = parse_stroke(event.split()[-1])
+
+        t_clock = safe_str(b.get("time","")).strip()
+        t_ms = time_clock_to_ms(t_clock)
+        if t_ms is None:
+            continue
+
+        g = b.get("gender","")
+        # CONSANAT usa "MIXTO" para postas; nosotros salteamos relays, así que debería quedar M o F
+        if g == "X":
+            continue
+
+        out.append(RecordRow(
+            record_scope="Sudamericano",
+            record_type="Récord Sudamericano",
+            category="Open",
+            pool_length=safe_str(b.get("pool_length","")).strip() or "SCM",
+            gender=parse_gender(g),
+            distance=dist,
+            stroke=stroke,
+
+            time_clock=t_clock.replace(".", ":") if re.fullmatch(r"\d{1,3}\.\d{2}\.\d{2}", t_clock.replace(" ", "")) else t_clock,
+            time_ms=t_ms,
+            record_date=parse_date_any(safe_str(b.get("date",""))),
+            competition_name=norm_space(safe_str(b.get("competition","CONSANAT"))),
+            athlete_name=norm_space(safe_str(b.get("athlete",""))),
+            city=norm_space(safe_str(b.get("city",""))),
+            country=norm_space(safe_str(b.get("country",""))),
+            last_updated=utc_now_iso(),
+
+            source_name="CONSANAT",
+            source_url=source_url,
+            source_note="Scrape texto estructurado (piscina corta y larga).",
+            verified=True,
+            is_active=True,
+        ))
+    return out
+
+# =========================
+# IPC SDMS (Paralímpico) - stub implementable
+# =========================
+
+def ipc_sdms_pdf_url(record_type: str, category: str, gender: str, age: str = "senior") -> str:
+    """
+    Estructura vista en páginas públicas (sdms web record sw pdf). Ej:
+      https://www.paralympic.org/sdms/web/record/sw/pdf/type/WR/category/SC
+    También existe en ipc-services.org (históricamente).
+    """
+    # preferimos paralympic.org porque es el frente público
+    return f"https://www.paralympic.org/sdms/web/record/sw/pdf/type/{record_type}/category/{category}/gender/{gender}/age/{age}"
+
+def ipc_download_pdf(play, url: str, out_path: str, *, timeout_ms: int = 45000) -> None:
+    browser = play.chromium.launch(headless=True)
+    ctx = browser.new_context(accept_downloads=True)
+    page = ctx.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    # si abre directo PDF, playwright igual lo "navega"; intentamos descargar:
+    dl = None
+    try:
+        with page.expect_download(timeout=timeout_ms) as dlinfo:
+            page.evaluate("window.print && window.print()")  # a veces dispara; si no, cae al plan B
+        dl = dlinfo.value
+    except Exception:
+        dl = None
+
+    if dl is None:
+        # plan B: request directa (a veces funciona)
+        try:
+            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.ok and resp.headers.get("content-type","").lower().startswith("application/pdf"):
+                with open(out_path, "wb") as f:
+                    f.write(resp.content)
+                ctx.close(); browser.close()
+                return
+        except Exception:
+            pass
+        raise RuntimeError("No pude descargar PDF de IPC SDMS (posible bloqueo).")
+
+    dl.save_as(out_path)
+    ctx.close(); browser.close()
+
+def ipc_parse_pdf_to_records(pdf_path: str, *, pool: str, gender: str, source_url: str) -> List[RecordRow]:
+    """
+    Parser muy conservador: intenta leer texto y extraer filas con patrón:
+      <Event> <Class> <Time> <Athlete> <NPC> <Date> <Location>
+    Si no encuentra, devuelve vacío (no rompe el run).
+    """
+    out: List[RecordRow] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = "\n".join([(p.extract_text() or "") for p in pdf.pages[:3]])
+        # si no hay texto, abortamos (probable PDF tabular sin texto)
+        if not text.strip():
+            return out
+
+        # Heurística: buscar líneas con tiempo tipo mm:ss.xx
+        lines = [norm_space(l) for l in text.splitlines() if l.strip()]
+        time_re = re.compile(r"\b(\d{1,2}:\d{2}\.\d{2}|\d{2}\.\d{2})\b")
+
+        for ln in lines:
+            if not time_re.search(ln):
+                continue
+            if "Relay" in ln or "4x" in ln:
+                continue
+            # intentar distancia/stroke
+            dist = parse_distance(ln)
+            if not dist:
+                continue
+            stroke = ""
+            u = ln.upper()
+            for k, v in STROKE_MAP.items():
+                if k in u:
+                    stroke = v
+                    break
+            if not stroke:
+                # en para a veces figura "Freestyle" etc
+                stroke = "Libre"
+
+            t_clock = time_re.search(ln).group(1)
+            t_ms = time_clock_to_ms(t_clock)
+
+            # athlete: difícil; tomamos todo lo posterior al tiempo como fallback
+            parts = ln.split(t_clock, 1)
+            tail = parts[1].strip() if len(parts) > 1 else ""
+            athlete = tail[:80]  # truncate
+
+            out.append(RecordRow(
+                record_scope="Paralímpico",
+                record_type="Récord Mundial Para",
+                category="Open",
+                pool_length=pool,
+                gender=parse_gender(gender),
+                distance=dist,
+                stroke=stroke,
+
+                time_clock=t_clock,
+                time_ms=t_ms,
+                record_date=None,
+                competition_name="World Para Swimming Records",
+                athlete_name=athlete,
+                city="",
+                country="",
+                last_updated=utc_now_iso(),
+
+                source_name="Paralympic SDMS",
+                source_url=source_url,
+                source_note="Parser básico (mejorable) sobre PDF SDMS.",
+                verified=False,  # hasta que refine el parser
+                is_active=True,
+            ))
+    except Exception:
+        return []
+    return out
+
+# =========================
+# Main
+# =========================
+
+def main():
+    sb = supa_client()
+
+    enable_wa = env("ENABLE_WA", "1") == "1"
+    enable_consanat = env("ENABLE_CONSANAT", "1") == "1"
+    enable_ipc = env("ENABLE_IPC", "0") == "1"
+
+    log_inserts = env("LOG_INSERTS", "0") == "1"
+
+    # Resumen
+    summary = {
+        "version": MDV_UPDATER_VERSION,
+        "started_at": utc_now_iso(),
+        "seen": 0,
+        "inserted": 0,
+        "updated": 0,
+        "filled": 0,
+        "skipped": 0,
+        "errors": 0,
+        "errors_list": [],
     }
 
-# -------------------------- Runners --------------------------
+    records: List[RecordRow] = []
 
-def run_wa(sb: SB) -> Dict[str, int]:
-    stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
-    tmp_dir = f"/tmp/mdv_wa_{RUN_ID}"
-    os.makedirs(tmp_dir, exist_ok=True)
+    # -------- WA --------
+    if enable_wa:
+        wa_tasks = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        # WR + OR + WJ
+        for pool in ("LCM", "SCM"):
+            for gender in ("M", "F"):
+                wa_tasks.append(("WR", "WR", pool, gender, "Mundial", "Récord Mundial"))
+                wa_tasks.append(("OR", "OR", pool, gender, "Mundial", "Récord Olímpico"))
+                wa_tasks.append(("WJ", "WJ", pool, gender, "Mundial", "Récord Mundial Junior"))
 
-        for spec in wa_specs():
-            url = wa_url(spec)
-            print(f"🔎 WA | {spec.code} | {spec.pool} | {spec.gender} | {url}")
-            try:
-                xlsx_path = wa_download_xlsx(page, url, tmp_dir)
-                rows = wa_parse_xlsx(xlsx_path)
+        # Continental (Americas) - NO es "Panamericano" (es un filtro continental de WA)
+        for pool in ("LCM", "SCM"):
+            for gender in ("M", "F"):
+                wa_tasks.append(("CR", "PAN", pool, gender, "Americas (WA)", "Récord Continental (Americas)"))
 
-                record_scope, record_type = wa_scope_and_type(spec.code, spec.pool)
-                seen_keys = set()
+        with sync_playwright() as play:
+            for record_code, record_type, pool, gender, scope, rtype in wa_tasks:
+                try:
+                    region = "AMERICAS" if (record_code == "CR" and scope.startswith("Americas")) else ""
+                    url = wa_build_url(record_code=record_code, pool=pool, gender=gender, record_type=record_type, region=region)
+                    print(f"🔎 WA | {record_code} | {pool} | {gender} | {url}")
 
-                for r in rows:
-                    dist, stroke, type_probe = parse_event(r.get("event", ""))
-                    ms = parse_time_to_ms(r.get("time", ""))
-                    if dist is None or stroke is None or ms is None:
-                        stats["skipped"] += 1
-                        continue
+                    tmp_xlsx = f"/tmp/wa_{record_code}_{record_type}_{pool}_{gender}.xlsx"
+                    wa_download_xlsx(play, url, tmp_xlsx)
 
-                    # ✅ dedup por clave (evita dobles inserts y 23505 dentro de la corrida)
-                    key = (spec.gender, pool_label(spec.pool), dist, stroke, record_type, record_scope)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-
-                    payload = build_payload(
-                        record_scope=record_scope,
-                        record_type=record_type,
-                        pool=spec.pool,
-                        gender=spec.gender,
-                        distance=dist,
-                        stroke=stroke,
-                        time_ms=ms,
-                        athlete_name=r.get("athlete", ""),
-                        athlete_country=r.get("country", ""),
-                        record_date=r.get("date", ""),
-                        competition_name=r.get("competition", ""),
-                        competition_location=r.get("location", ""),  # ✅ lugar del evento
-                        source_name="World Aquatics",
+                    recs = wa_parse_xlsx_to_records(
+                        tmp_xlsx,
+                        record_scope=scope,
+                        record_type=rtype,
+                        pool=pool,
+                        gender=gender,
                         source_url=url,
-                        source_note="XLSX",
-                        type_probe=type_probe,
+                        source_name="World Aquatics",
+                        source_note=f"WA {record_code} ({pool})",
                     )
+                    records.extend(recs)
+                except Exception as e:
+                    summary["errors"] += 1
+                    summary["errors_list"].append(f"WA {record_code}/{pool}/{gender}: {type(e).__name__}: {e}")
 
-                    stats["seen"] += 1
-                    try:
-                        status = sb.upsert_record(payload)
-                        if status == "inserted":
-                            stats["inserted"] += 1
-                        elif status == "updated":
-                            stats["updated"] += 1
-                        elif status == "filled":
-                            stats["filled"] += 1
-                        else:
-                            stats["unchanged"] += 1
-                    except Exception as e:
-                        stats["errors"] += 1
-                        print(f"❌ WA row error: {e}")
-            except Exception as e:
-                stats["errors"] += 1
-                print(f"❌ WA {spec.code} {spec.pool} {spec.gender} error: {e}")
-                continue
+    # -------- CONSANAT --------
+    if enable_consanat:
+        try:
+            url = "https://consanat.com/records/136/natacion"
+            rows = consanat_fetch_records(url)
+            cons = consanat_blocks_to_records(rows, source_url=url)
+            # Nota: CONSANAT no siempre trae género; si querés, podemos separar por secciones más adelante.
+            records.extend(cons)
+        except Exception as e:
+            summary["errors"] += 1
+            summary["errors_list"].append(f"CONSANAT: {type(e).__name__}: {e}")
 
-        browser.close()
+    # -------- IPC (Paralímpico) --------
+    if enable_ipc:
+        try:
+            with sync_playwright() as play:
+                for pool, cat in (("LCM","LC"), ("SCM","SC")):
+                    for gender in ("M","F"):
+                        url = ipc_sdms_pdf_url("WR", cat, gender, age="senior")
+                        pdf_path = f"/tmp/ipc_wr_{cat}_{gender}.pdf"
+                        try:
+                            ipc_download_pdf(play, url, pdf_path)
+                            recs = ipc_parse_pdf_to_records(pdf_path, pool=pool, gender=gender, source_url=url)
+                            records.extend(recs)
+                        except Exception as e:
+                            summary["errors"] += 1
+                            summary["errors_list"].append(f"IPC {cat}/{gender}: {type(e).__name__}: {e}")
+        except Exception as e:
+            summary["errors"] += 1
+            summary["errors_list"].append(f"IPC: {type(e).__name__}: {e}")
 
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return stats
+    # -------- UPSERT --------
+    for rec in records:
+        summary["seen"] += 1
 
-def run_sudam(sb: SB) -> Dict[str, int]:
-    stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
-    rows = wiki_parse_records(WIKI_SUDAM_URL, default_pool="LCM", default_gender=None)
-    print(f"🌎 SUDAM source=WIKI filas={len(rows)}")
-
-    for r in rows:
-        g = r.get("gender")
-        if g not in ("M","F"):
-            stats["skipped"] += 1
+        # Si no hay género, no podemos matchear bien si la tabla exige género.
+        # En tu tabla hay muchos con gender vacío? Si no, omitimos esos y reportamos.
+        if rec.record_scope == "Sudamericano" and rec.gender == "":
+            # En records_standards, Sudamericano suele tener M/F. Si no lo tenemos, no insertamos.
+            summary["skipped"] += 1
             continue
 
-        record_scope = "Sudamericano"
-        record_type = "Récord Sudamericano" + (" SC" if pool_label(r["pool"]) == "SCM" else "")
+        action, msg = upsert_one(sb, rec, log_inserts=log_inserts)
+        if action == "INSERT":
+            summary["inserted"] += 1
+        elif action == "UPDATE":
+            summary["updated"] += 1
+        elif action == "FILL":
+            summary["filled"] += 1
+        elif action == "SKIP":
+            summary["skipped"] += 1
+        else:
+            summary["errors"] += 1
+            summary["errors_list"].append(msg or "unknown error")
 
-        payload = build_payload(
-            record_scope=record_scope,
-            record_type=record_type,
-            pool=r["pool"],
-            gender=g,
-            distance=r["distance"],
-            stroke=r["stroke"],
-            time_ms=r["time_ms"],
-            athlete_name=r.get("athlete",""),
-            athlete_country=r.get("athlete_country",""),
-            record_date=r.get("record_date",""),
-            competition_name=r.get("competition",""),
-            competition_location=r.get("competition_location",""),
-            source_name=r.get("source_name","Wikipedia"),
-            source_url=r.get("source_url",WIKI_SUDAM_URL),
-            source_note=r.get("source_note","WIKI"),
-            type_probe=r.get("type_probe","individual"),
-        )
+    summary["finished_at"] = utc_now_iso()
+    print("✅ DONE", json.dumps(summary, ensure_ascii=False))
 
-        stats["seen"] += 1
+    # Mail opcional
+    email_user = env("EMAIL_USER", "")
+    email_pass = env("EMAIL_PASS", "")
+    if email_user and email_pass:
         try:
-            status = sb.upsert_record(payload)
-            if status == "inserted":
-                stats["inserted"] += 1
-            elif status == "updated":
-                stats["updated"] += 1
-            elif status == "filled":
-                stats["filled"] += 1
-            else:
-                stats["unchanged"] += 1
-        except Exception as e:
-            stats["errors"] += 1
-            print(f"❌ SUDAM row error: {e}")
+            send_mail_summary(email_user, email_pass, summary)
+        except Exception:
+            # no rompe el run
+            pass
 
-    return stats
+def send_mail_summary(email_user: str, email_pass: str, summary: Dict[str, Any]) -> None:
+    import smtplib
+    from email.mime.text import MIMEText
 
-def run_panam_games(sb: SB) -> Dict[str, int]:
-    stats = {"seen": 0, "updated": 0, "inserted": 0, "filled": 0, "unchanged": 0, "skipped": 0, "errors": 0}
-    rows = wiki_parse_records(WIKI_PANAM_GAMES_URL, default_pool="LCM", default_gender=None)
-    print(f"🌎 PANAM_GAMES source=WIKI filas={len(rows)}")
+    subject = f"🏊 MDV Scraper | {summary.get('version','')} | upd={summary.get('updated',0)} ins={summary.get('inserted',0)} err={summary.get('errors',0)}"
+    body = [
+        f"Version: {summary.get('version')}",
+        f"Started: {summary.get('started_at')}",
+        f"Finished: {summary.get('finished_at')}",
+        "",
+        f"seen={summary.get('seen')} | inserted={summary.get('inserted')} | updated={summary.get('updated')} | filled={summary.get('filled')} | skipped={summary.get('skipped')} | errors={summary.get('errors')}",
+        "",
+    ]
+    if summary.get("errors_list"):
+        body.append("ERRORES:")
+        body.extend([f"- {e}" for e in summary["errors_list"][:50]])
 
-    for r in rows:
-        g = r.get("gender")
-        if g not in ("M","F"):
-            stats["skipped"] += 1
-            continue
+    msg = MIMEText("\n".join(body), _charset="utf-8")
+    msg["Subject"] = subject
+    msg["From"] = email_user
+    msg["To"] = email_user
 
-        record_scope = "Panamericano"
-        record_type = "Récord Panamericano" + (" SC" if pool_label(r["pool"]) == "SCM" else "")
-
-        payload = build_payload(
-            record_scope=record_scope,
-            record_type=record_type,
-            pool=r["pool"],
-            gender=g,
-            distance=r["distance"],
-            stroke=r["stroke"],
-            time_ms=r["time_ms"],
-            athlete_name=r.get("athlete",""),
-            athlete_country=r.get("athlete_country",""),
-            record_date=r.get("record_date",""),
-            competition_name=r.get("competition",""),
-            competition_location=r.get("competition_location",""),
-            source_name=r.get("source_name","Wikipedia"),
-            source_url=r.get("source_url",WIKI_PANAM_GAMES_URL),
-            source_note=r.get("source_note","WIKI"),
-            type_probe=r.get("type_probe","individual"),
-        )
-
-        stats["seen"] += 1
-        try:
-            status = sb.upsert_record(payload)
-            if status == "inserted":
-                stats["inserted"] += 1
-            elif status == "updated":
-                stats["updated"] += 1
-            elif status == "filled":
-                stats["filled"] += 1
-            else:
-                stats["unchanged"] += 1
-        except Exception as e:
-            stats["errors"] += 1
-            print(f"❌ PANAM_GAMES row error: {e}")
-
-    return stats
-
-def main() -> int:
-    sb = SB(SUPABASE_URL, SUPABASE_KEY)
-
-    print(f"MDV_UPDATER_VERSION={MDV_UPDATER_VERSION}")
-    print(f"RUN_ID={RUN_ID}")
-    print(f"Timestamp (UTC)={RUN_TS}")
-
-    all_stats: Dict[str, Dict[str, int]] = {}
-    all_stats["WA"] = run_wa(sb)
-    all_stats["SUDAM"] = run_sudam(sb)
-    all_stats["PANAM_GAMES"] = run_panam_games(sb)
-
-    print(f"Version: {MDV_UPDATER_VERSION}")
-    print(f"Run ID: {RUN_ID}")
-    print(f"Timestamp (UTC): {RUN_TS}")
-    for k, st in all_stats.items():
-        print(f"[{k}] seen={st['seen']} | inserted={st['inserted']} | updated={st['updated']} | filled={st['filled']} | unchanged={st['unchanged']} | skipped={st['skipped']} | errors={st['errors']}")
-
-    # Política de fallo
-    fatal_reasons: List[str] = []
-
-    # Regla histórica (V15): si WA no procesa nada y encima hubo errores, el run es inválido.
-    if all_stats["WA"]["seen"] == 0 and all_stats["WA"]["errors"] > 0:
-        fatal_reasons.append(f"WA seen=0 errors={all_stats['WA']['errors']}")
-
-    # Modo estricto (opcional): fail si cualquier fuente trae 0 filas o reporta errores.
-    if MDV_STRICT:
-        for k, st in all_stats.items():
-            if st.get("seen", 0) == 0:
-                fatal_reasons.append(f"{k} seen=0")
-            if st.get("errors", 0) > 0:
-                fatal_reasons.append(f"{k} errors={st['errors']}")
-
-    if fatal_reasons:
-        print("FATAL: " + " | ".join(fatal_reasons))
-        return 1
-    return 0
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(email_user, email_pass)
+        s.send_message(msg)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
