@@ -1,5 +1,4 @@
 name: Spider CADDA Automático
-
 on:
   schedule:
     - cron: '0 11 * * 1' # Ejecutar todos los Lunes a las 11:00 UTC (8 AM ARG)
