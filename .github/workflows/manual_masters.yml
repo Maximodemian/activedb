@@ -1,6 +1,9 @@
 name: Actualizar Masters USA (Manual)
 
 on:
+  schedule:
+    # "A las 09:00 UTC el día 1 de cada mes"
+    - cron: '0 9 1 * *'
   workflow_dispatch: # Esto crea el botón "Run Workflow" manual
 
 jobs:
