@@ -1,0 +1,31 @@
+name: Spider CADDA Automático
+
+on:
+  schedule:
+    - cron: '0 11 * * 1' # Ejecutar todos los Lunes a las 11:00 UTC (8 AM ARG)
+  workflow_dispatch: # Botón manual por si quieres forzarlo
+
+jobs:
+  spider-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install Libs
+        run: |
+          pip install -r requirements.txt
+          pip install beautifulsoup4 # Aseguramos que esté bs4
+          
+      - name: Run Spider
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+        run: python update_cadda_auto.py
