@@ -33,11 +33,8 @@ def clean_time(time_str):
     except: return None
 
 def cazar_records_usms(age_group, course_code, gender_code):
-    # gender_code: 'M' o 'F'
     print(f"🦈 Cazando USMS | Edad: {age_group} | Pileta: {course_code} | Sexo: {gender_code}...")
     
-    # URL con parámetro de sexo explícito para asegurar que traiga la tabla correcta
-    # Parameters: ri=i (Individual), course, age, sex (M/F)
     url = f"https://www.usms.org/comp/poolrecords.php?ri=i&course={course_code}&age={age_group}&sex={gender_code}"
     
     data_to_insert = []
@@ -55,14 +52,13 @@ def cazar_records_usms(age_group, course_code, gender_code):
             print("   ⚠️ No se encontraron tablas.")
             return []
 
-        # Iteramos tablas (por si devuelve varias, aunque con el filtro sex debería ser una)
         for i, df in enumerate(dfs):
             df.columns = [str(c).lower().strip() for c in df.columns]
             
             if 'event' not in df.columns or 'time' not in df.columns:
                 continue
 
-            # Usamos el género que pedimos en la URL
+            # Género actual
             current_gender = gender_code
             
             count_table = 0
@@ -90,6 +86,9 @@ def cazar_records_usms(age_group, course_code, gender_code):
                 t_seg = clean_time(time_val)
                 
                 if t_seg:
+                    # CORRECCIÓN: Convertir a milisegundos
+                    t_ms = int(t_seg * 1000)
+                    
                     record = {
                         "athlete_name": name,
                         "athlete_nationality": "United States",
@@ -99,20 +98,21 @@ def cazar_records_usms(age_group, course_code, gender_code):
                         "stroke": style,
                         "distance": dist,
                         "time_clock": str(time_val).strip(),
-                        "time_s": t_seg,
+                        
+                        # CAMBIO CLAVE: time_s -> time_ms
+                        "time_ms": t_ms, 
+                        
                         "record_scope": "MASTER",
                         "record_type": "Récord USMS",
                         "record_date": pd.to_datetime(date_val).strftime('%Y-%m-%d') if date_val and str(date_val) != 'nan' else None,
-                        "source_name": "USMS Hunt V3.1",
-                        
-                        # CORRECCIÓN AQUÍ: Usamos 'country' en lugar de 'competition_country'
-                        "country": "United States" 
+                        "source_name": "USMS Hunt V3.2",
+                        "country": "United States"
                     }
                     data_to_insert.append(record)
                     count_table += 1
             
             if count_table > 0:
-                print(f"      ✅ Tabla encontrada: {count_table} récords ({current_gender}).")
+                print(f"      ✅ Tabla procesada: {count_table} récords ({current_gender}).")
 
     except Exception as e:
         print(f"   ❌ Error: {e}")
@@ -121,7 +121,6 @@ def cazar_records_usms(age_group, course_code, gender_code):
 
 def ejecutar_caceria():
     total_injected = 0
-    # Iteramos también por Género para asegurar cobertura 100%
     for age in TARGET_AGE_GROUPS:
         for course in ["SCY", "LCM", "SCM"]:
             for sex in ["M", "F"]:
@@ -134,9 +133,9 @@ def ejecutar_caceria():
                     except Exception as db_err:
                         print(f"      🔥 Error DB: {db_err}")
                 else:
-                    pass # Silencioso si no encuentra para no ensuciar log
+                    pass 
 
-    print(f"\n🏆 Misión Cumplida V3.1. Total presas capturadas: {total_injected}")
+    print(f"\n🏆 Misión Cumplida V3.2. Total presas capturadas: {total_injected}")
 
 if __name__ == "__main__":
     ejecutar_caceria()
