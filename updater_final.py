@@ -3,8 +3,9 @@
 """
 MDV Records Updater (World Aquatics + Sudamericano + PanAm Games)
 
-- country/city: datos del atleta (según tu regla)
-- competition_location: lugar del evento (texto)
+- city/country: sede del récord (ciudad/país de la competencia)
+- athlete_nationality: nacionalidad/representación del atleta (ISO3/NOC)
+- competition_location: lugar del evento (texto crudo, opcional)
 - athlete_name: SOLO nombres
 - type_probe: individual | relay
 - Parche 23505 (duplicate key) + fix 'location' no inicializada
@@ -340,11 +341,13 @@ class SB:
         old_ms = existing.get("time_ms") if existing else None
         time_changed = (existing is not None) and (new_ms is not None) and (old_ms is not None) and (int(new_ms) != int(old_ms))
 
+
         fill_fields = [
             "athlete_name",
+            "athlete_nationality",
             "country", "city",
             "record_date",
-            "competition_name", "competition_location",
+            "competition_name", "competition_location", "Competition_location",
             "source_name", "source_url", "source_note",
             "type_probe",
         ]
@@ -359,6 +362,21 @@ class SB:
                     continue
                 if _is_empty(oldv):
                     updates[f] = newv
+
+
+
+            # ✅ FORCE UPDATE: athlete_nationality (si viene de una fuente autoritativa y cambió)
+            new_nat = payload_full.get("athlete_nationality")
+            old_nat = existing.get("athlete_nationality")
+            if not _is_empty(new_nat) and new_nat != old_nat:
+                updates["athlete_nationality"] = new_nat
+
+            # ✅ Mantener sincronizado el campo de sede crudo si cambió y no está vacío (solo para completar vacíos)
+            new_loc = payload_full.get("Competition_location") or payload_full.get("competition_location")
+            old_loc = existing.get("Competition_location") or existing.get("competition_location")
+            if not _is_empty(new_loc) and _is_empty(old_loc):
+                updates["Competition_location"] = new_loc
+                updates["competition_location"] = new_loc
 
             if time_changed:
                 updates["time_ms"] = int(payload_full["time_ms"])
@@ -650,6 +668,33 @@ def wiki_parse_records(url: str, default_pool: str = "LCM", default_gender: Opti
 
 # -------------------------- Payload builder --------------------------
 
+def parse_competition_location(loc: str) -> Tuple[str, str]:
+    """Parsea un texto de sede a (city, country_code_or_name).
+    Acepta formatos típicos:
+    - 'Buenos Aires (ARG)'
+    - 'Fukuoka, JPN' / 'Fukuoka, Japan'
+    - 'Netanya, Israel'
+    Si no puede inferir país, devuelve ('', '') o (city, '') según el caso.
+    """
+    loc = _strip(loc)
+    if not loc:
+        return ("", "")
+    # Caso: "Ciudad (ABC)" o "Ciudad (Argentina)"
+    m = re.match(r"^(.*?)\s*\(([^)]+)\)\s*$", loc)
+    if m:
+        city = _strip(m.group(1))
+        country = _strip(m.group(2))
+        return (city, country)
+    # Caso: "Ciudad, País"
+    if "," in loc:
+        parts = [p.strip() for p in loc.split(",") if p and str(p).strip()]
+        if len(parts) >= 2:
+            city = parts[0]
+            country = parts[-1]
+            return (city, country)
+    # Caso: solo ciudad (no inventamos país)
+    return (loc, "")
+
 def build_payload(
     record_scope: str,
     record_type: str,
@@ -668,7 +713,11 @@ def build_payload(
     source_note: str,
     type_probe: str,
 ) -> Dict[str, Any]:
+    # Validación: un récord no debería carecer de nacionalidad/representación del atleta.
+    if (source_name or "").strip() == "World Aquatics" and _is_empty(athlete_country):
+        raise ValueError("World Aquatics record without athlete nationality (country/NOC).")
     t2 = format_ms_to_hms_2dp(int(time_ms))
+    comp_city, comp_country = parse_competition_location(competition_location or "")
     return {
         "gender": gender_label(gender),
         "category": "Open",
@@ -681,10 +730,12 @@ def build_payload(
         "record_scope": record_scope,
         "record_type": record_type,
         "competition_name": competition_name or "",
-        "competition_location": competition_location or "",  # ✅ NUEVO
+        "competition_location": competition_location or "",
+        "Competition_location": competition_location or "",
         "athlete_name": athlete_name or "",
-        "country": athlete_country or "",  # atleta
-        "city": "",                        # atleta (no suele venir)
+        "athlete_nationality": athlete_country or "",
+        "country": comp_country or "",  # sede/país competencia
+        "city": comp_city or "",        # sede/ciudad competencia
         "record_date": parse_date(record_date) or None,
         "last_updated": RUN_DATE,
         "source_name": source_name or "",
