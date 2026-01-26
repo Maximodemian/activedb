@@ -1,0 +1,30 @@
+name: Cazar Récords USMS (Jóvenes)
+
+on:
+  schedule:
+    # Ejecutar a las 08:00 UTC el día 1 de cada mes
+    - cron: '0 8 1 * *'
+  workflow_dispatch: # Botón para ejecutar manualmente cuando quieras
+
+jobs:
+  hunt-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          pip install requests pandas beautifulsoup4 python-dotenv supabase lxml html5lib
+          # Nota: lxml y html5lib son necesarios para que pandas lea tablas HTML
+        
+      - name: Run USMS Hunter
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python hunt_usms_young.py
