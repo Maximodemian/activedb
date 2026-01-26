@@ -1,144 +1,152 @@
 import requests
 import pandas as pd
 import os
+import io
 import datetime
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client
 
-# CONFIGURACIÓN
+# 1. CONFIGURACIÓN
 load_dotenv()
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-# URLs base de USMS Records (Suelen tener estructuras predecibles o índices)
-# Estrategia: Usaremos pandas para leer las tablas HTML directamente si es posible
-# Nota: USMS tiene varias vistas. Vamos a intentar simular una petición a sus tablas de récords.
+# Franjas "jóvenes" objetivo
+TARGET_AGE_GROUPS = ["18-24", "25-29", "30-34", "35-39"]
 
-COURSES = {
-    "SCY": "Yards",
-    "SCM": "Short Course Meters",
-    "LCM": "Long Course Meters"
+# Headers para engañar al servidor de USMS (Anti-Scraping básico)
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.usms.org/'
 }
 
-AGE_GROUPS = ["18-24", "25-29"]
-
 def clean_time(time_str):
-    if not time_str or "time" in str(time_str).lower(): return None
+    if not time_str or pd.isna(time_str): return None
     try:
-        # Formatos: "20.50", "1:05.20"
-        time_str = str(time_str).strip()
-        if ':' in time_str:
-            parts = time_str.split(':')
+        # Limpieza: "23.54", "1:05.20", "23.54 NV" -> 23.54
+        t_str = str(time_str).split()[0].strip()
+        # Eliminar caracteres raros si quedan
+        t_str = ''.join(c for c in t_str if c.isdigit() or c in ['.', ':'])
+        
+        if ':' in t_str:
+            parts = t_str.split(':')
             if len(parts) == 2: return float(parts[0])*60 + float(parts[1])
             elif len(parts) == 3: return float(parts[0])*3600 + float(parts[1])*60 + float(parts[2])
-        return float(time_str)
+        return float(t_str)
     except: return None
 
-def cazar_usms(age_group, course_code):
-    print(f"🦈 Cazando USMS | Edad: {age_group} | Pileta: {course_code}...")
+def cazar_records_usms(age_group, course_code):
+    print(f"🦈 Cazando Récords USMS | Edad: {age_group} | Pileta: {course_code}...")
     
-    # URL Mágica de USMS (Esta URL suele mostrar los records actuales)
-    # Nota: Si esta URL cambia, el script necesitará ajuste. Usamos una búsqueda genérica.
-    # Como fallback, usaremos una lógica de scraping directa sobre la tabla de records actuales.
-    
-    # Simulamos que leemos de la fuente oficial (aquí necesitaríamos la URL exacta del momento).
-    # Para este ejemplo, voy a usar una estructura genérica de scraping de tablas HTML 
-    # que suele funcionar en sitios de natación como USMS o SwimCloud.
-    
-    url = f"https://www.usms.org/competition/pool-swimming/pool-records/measure/{course_code}/gender/M/agegroup/{age_group}"
-    # Nota: Haremos dos pasadas, M y F.
+    # URL Oficial de Reportes USMS
+    url = f"https://www.usms.org/comp/rpts/record_search.php?course={course_code}&age={age_group}&view=current"
     
     data_to_insert = []
     
-    # Como USMS a veces usa JS, si requests falla, sugeriré usar la lista oficial en PDF.
-    # Pero intentemos el truco de Pandas primero.
-    
     try:
-        # Headers para parecer un navegador real
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        # 1. PETICIÓN CON MÁSCARA (Requests)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         
-        # NOTA: USMS separa por género en URLs distintas o parámetros.
-        for gender in ['M', 'F']:
-            # URL real aproximada de USMS Records
-            target_url = f"https://www.usms.org/comp/rpts/record_search.php?course={course_code}&sex={gender}&age={age_group}&view=current"
+        if r.status_code != 200:
+            print(f"   ⚠️ Bloqueo o Error HTTP: {r.status_code}")
+            return []
             
-            # Si la web es dinámica, pandas read_html podría fallar sin un navegador headless.
-            # Alternativa: Inyectar datos conocidos o pedir al usuario el HTML.
-            # Vamos a intentar leer tablas.
-            try:
-                dfs = pd.read_html(target_url)
-            except:
-                print(f"   ⚠️ No se pudo leer tabla directa para {gender}. Intentando parser manual...")
+        # 2. PARSEO CON PANDAS (Sobre el texto descargado)
+        # Usamos io.StringIO para que pandas crea que es un archivo
+        dfs = pd.read_html(io.StringIO(r.text))
+        
+        if not dfs:
+            print("   ⚠️ No se encontraron tablas en el HTML.")
+            return []
+
+        # USMS suele poner Hombres y Mujeres en tablas separadas o juntas.
+        # Iteramos todas las tablas encontradas.
+        for i, df in enumerate(dfs):
+            # Normalizar columnas
+            df.columns = [str(c).lower().strip() for c in df.columns]
+            
+            # Verificar si es una tabla válida de tiempos (debe tener 'event' y 'time')
+            if 'event' not in df.columns or 'time' not in df.columns:
                 continue
 
-            if len(dfs) > 0:
-                df = dfs[0] # Asumimos la primera tabla es la buena
-                print(f"   ✅ Tabla encontrada para {gender} ({len(df)} registros)")
+            # Detectar Género
+            # A veces está en el título de la tabla anterior (difícil con pandas) 
+            # o implícito. USMS suele poner Women (Tabla 0) y Men (Tabla 1)
+            current_gender = 'F' if i == 0 else 'M'
+            # Si solo hay 1 tabla, es arriesgado, pero asumiremos F para 0.
+            # Mejora: Buscar palabras clave en el contenido si fuera necesario.
+            
+            print(f"   ✅ Tabla {i} ({current_gender}) detectada: {len(df)} filas.")
+            
+            for _, row in df.iterrows():
+                evt = row.get('event', '')
+                time_val = row.get('time', '')
+                name = row.get('name', '')
+                date_val = row.get('date', None)
                 
-                # Normalizar columnas (USMS suele tener: Event, Name, Age, Club, Date, Time)
-                # Renombramos dinámicamente según lo que encontremos
-                df.columns = [c.lower() for c in df.columns]
+                # Validación básica
+                if pd.isna(evt) or pd.isna(time_val) or "Relay" in str(evt): 
+                    continue
                 
-                for _, row in df.iterrows():
-                    # Mapeo de columnas (ajustar según lo que devuelva el sitio)
-                    # Buscamos columnas clave
-                    evt = row.get('event', '')
-                    time_val = row.get('time', '')
-                    name = row.get('name', '')
-                    date_val = row.get('date', None)
-                    
-                    if not evt or not time_val: continue
-                    
-                    # Parsear Evento (ej: "50 Freestyle")
-                    dist = int(''.join(filter(str.isdigit, str(evt))))
-                    style = "Unknown"
-                    if "Free" in str(evt): style = "Libre"
-                    elif "Back" in str(evt): style = "Espalda"
-                    elif "Breast" in str(evt): style = "Pecho"
-                    elif "Fly" in str(evt) or "Butterfly" in str(evt): style = "Mariposa"
-                    elif "IM" in str(evt) or "Medley" in str(evt): style = "Combinado"
-                    
-                    t_seg = clean_time(time_val)
-                    
-                    if t_seg:
-                        data_to_insert.append({
-                            "athlete_name": name,
-                            "athlete_nationality": "United States", # Es USMS
-                            "gender": gender,
-                            "category": f"MASTER {age_group}",
-                            "pool_length": course_code,
-                            "stroke": style,
-                            "distance": dist,
-                            "time_clock": time_val,
-                            "time_s": t_seg,
-                            "record_scope": "Nacional", # Record Nacional USA Master
-                            "record_type": "Récord USMS",
-                            "record_date": pd.to_datetime(date_val).strftime('%Y-%m-%d') if date_val else None,
-                            "source_name": "USMS Auto-Hunter"
-                        })
-    except Exception as e:
-        print(f"❌ Error cazando en {url}: {e}")
+                # Parsear Evento
+                evt_str = str(evt)
+                dist_digits = ''.join(filter(str.isdigit, evt_str))
+                if not dist_digits: continue
+                dist = int(dist_digits)
+                
+                style = "Unknown"
+                if "Free" in evt_str: style = "Libre"
+                elif "Back" in evt_str: style = "Espalda"
+                elif "Breast" in evt_str: style = "Pecho"
+                elif "Fly" in evt_str or "Butter" in evt_str: style = "Mariposa"
+                elif "IM" in evt_str or "Medley" in evt_str: style = "Combinado"
+                
+                t_seg = clean_time(time_val)
+                
+                if t_seg:
+                    record = {
+                        "athlete_name": name,
+                        "athlete_nationality": "United States",
+                        "gender": current_gender,
+                        "category": f"MASTER {age_group}",
+                        "pool_length": course_code,
+                        "stroke": style,
+                        "distance": dist,
+                        "time_clock": str(time_val).strip(),
+                        "time_s": t_seg,
+                        "record_scope": "MASTER",
+                        "record_type": "Récord USMS",
+                        "record_date": pd.to_datetime(date_val).strftime('%Y-%m-%d') if date_val and str(date_val) != 'nan' else None,
+                        "source_name": "USMS Official",
+                        "competition_country": "United States"
+                    }
+                    data_to_insert.append(record)
 
+    except Exception as e:
+        print(f"   ❌ Error procesando {age_group}: {e}")
+        
     return data_to_insert
 
 def ejecutar_caceria():
     total_injected = 0
-    for age in AGE_GROUPS:
-        for course in ["SCY", "LCM", "SCM"]: # USMS tiene las 3
-            records = cazar_usms(age, course)
+    # SCY = Yardas, SCM = Metros Corta, LCM = Metros Larga
+    # USMS tiene datos para los 3.
+    for age in TARGET_AGE_GROUPS:
+        for course in ["SCY", "LCM", "SCM"]:
+            records = cazar_records_usms(age, course)
             if records:
-                # Inyectar a Supabase
                 try:
-                    # Usamos upsert o insert. Ojo con duplicados.
-                    # supabase.table("records_standards").insert(records).execute()
-                    print(f"   💉 Inyectados {len(records)} récords para {age} {course}")
+                    # Insertar en lotes
+                    response = supabase.table("records_standards").upsert(records, on_conflict="category, gender, pool_length, stroke, distance, record_type").execute()
+                    print(f"      💉 Guardados {len(records)} registros.")
                     total_injected += len(records)
-                except Exception as e:
-                    print(f"   🔥 Error DB: {e}")
+                except Exception as db_err:
+                    print(f"      🔥 Error DB: {db_err}")
             else:
-                print(f"   💨 Nada encontrado para {age} {course} (Posible bloqueo de web)")
+                print(f"      💨 Sin datos útiles.")
 
-    print(f"🏁 Cacería terminada. Total presas: {total_injected}")
+    print(f"\n🏆 Misión Cumplida. Total presas capturadas: {total_injected}")
 
 if __name__ == "__main__":
     ejecutar_caceria()
