@@ -13,7 +13,6 @@ supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABAS
 # Franjas "jóvenes" objetivo
 TARGET_AGE_GROUPS = ["18-24", "25-29", "30-34", "35-39"]
 
-# Headers para parecer un navegador real (Chrome)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -23,7 +22,6 @@ HEADERS = {
 def clean_time(time_str):
     if not time_str or pd.isna(time_str): return None
     try:
-        # Limpieza: "23.54", "1:05.20", "23.54 NV" -> 23.54
         t_str = str(time_str).split()[0].strip()
         t_str = ''.join(c for c in t_str if c.isdigit() or c in ['.', ':'])
         
@@ -34,62 +32,39 @@ def clean_time(time_str):
         return float(t_str)
     except: return None
 
-def cazar_records_usms(age_group, course_code):
-    print(f"🦈 Cazando Récords USMS | Edad: {age_group} | Pileta: {course_code}...")
+def cazar_records_usms(age_group, course_code, gender_code):
+    # gender_code: 'M' o 'F'
+    print(f"🦈 Cazando USMS | Edad: {age_group} | Pileta: {course_code} | Sexo: {gender_code}...")
     
-    # NUEVA URL DETECTADA 2026: poolrecords.php
-    # Parámetros probables: ri=i (Individual), course, age
-    url = f"https://www.usms.org/comp/poolrecords.php?ri=i&course={course_code}&age={age_group}"
+    # URL con parámetro de sexo explícito para asegurar que traiga la tabla correcta
+    # Parameters: ri=i (Individual), course, age, sex (M/F)
+    url = f"https://www.usms.org/comp/poolrecords.php?ri=i&course={course_code}&age={age_group}&sex={gender_code}"
     
     data_to_insert = []
     
     try:
-        # 1. Petición HTTP
         r = requests.get(url, headers=HEADERS, timeout=15)
         
         if r.status_code != 200:
-            print(f"   ⚠️ Error HTTP {r.status_code}: La URL ha cambiado o está caída.")
+            print(f"   ⚠️ Error HTTP {r.status_code}")
             return []
             
-        # 2. Parseo HTML con Pandas
-        # USMS suele devolver 2 tablas: Mujeres (Women) y Hombres (Men), o una sola si se filtra.
         dfs = pd.read_html(io.StringIO(r.text))
         
         if not dfs:
-            print("   ⚠️ No se encontraron tablas en el HTML (posible página vacía).")
+            print("   ⚠️ No se encontraron tablas.")
             return []
 
-        print(f"   🔎 Tablas encontradas: {len(dfs)}")
-
+        # Iteramos tablas (por si devuelve varias, aunque con el filtro sex debería ser una)
         for i, df in enumerate(dfs):
-            # Normalizar columnas
             df.columns = [str(c).lower().strip() for c in df.columns]
             
-            # Verificar validez (Debe tener Evento y Tiempo)
             if 'event' not in df.columns or 'time' not in df.columns:
                 continue
 
-            # Detectar Género
-            # A menudo la tabla 0 es Mujeres y la 1 es Hombres, pero buscaremos pistas en el contenido
-            # O simplemente guardaremos ambos y dejaremos que el dashboard filtre.
-            # Asumiremos el orden estándar de USMS: 0=Women, 1=Men (si hay 2).
-            # Si hay 1, intentamos adivinar o ponemos 'X' (Mixto).
+            # Usamos el género que pedimos en la URL
+            current_gender = gender_code
             
-            current_gender = 'X'
-            if len(dfs) == 2:
-                current_gender = 'F' if i == 0 else 'M'
-            elif len(dfs) == 1:
-                # Si solo hay una, podría ser cualquier cosa. 
-                # Buscamos pistas en los nombres de nadadores famosos si pudiéramos, 
-                # pero por seguridad usaremos 'M' y 'F' en pasadas separadas si fuera necesario.
-                # Por ahora, marcaremos como 'Mixed' o 'Unknown' si no estamos seguros.
-                # TRUCO: USMS suele poner "Women" o "Men" en la primera fila o caption.
-                # Vamos a asumir que si pedimos el grupo de edad, nos da ambos.
-                # Si el script falla en género, lo corregiremos luego. 
-                # Asumiremos i=0 -> F para probar.
-                current_gender = 'F' 
-            
-            # Inyección de registros
             count_table = 0
             for _, row in df.iterrows():
                 evt = row.get('event', '')
@@ -99,7 +74,7 @@ def cazar_records_usms(age_group, course_code):
                 
                 if pd.isna(evt) or pd.isna(time_val) or "Relay" in str(evt): continue
                 
-                # Parsear Distancia y Estilo
+                # Parsear Distancia
                 evt_str = str(evt)
                 dist_digits = ''.join(filter(str.isdigit, evt_str))
                 if not dist_digits: continue
@@ -128,37 +103,40 @@ def cazar_records_usms(age_group, course_code):
                         "record_scope": "MASTER",
                         "record_type": "Récord USMS",
                         "record_date": pd.to_datetime(date_val).strftime('%Y-%m-%d') if date_val and str(date_val) != 'nan' else None,
-                        "source_name": "USMS Hunt V3",
-                        "competition_country": "United States"
+                        "source_name": "USMS Hunt V3.1",
+                        
+                        # CORRECCIÓN AQUÍ: Usamos 'country' en lugar de 'competition_country'
+                        "country": "United States" 
                     }
                     data_to_insert.append(record)
                     count_table += 1
             
-            print(f"      ✅ Tabla {i} ({current_gender}): {count_table} récords extraídos.")
+            if count_table > 0:
+                print(f"      ✅ Tabla encontrada: {count_table} récords ({current_gender}).")
 
     except Exception as e:
-        print(f"   ❌ Error procesando {age_group}: {e}")
+        print(f"   ❌ Error: {e}")
         
     return data_to_insert
 
 def ejecutar_caceria():
     total_injected = 0
-    # USMS tiene SCY, LCM, SCM
+    # Iteramos también por Género para asegurar cobertura 100%
     for age in TARGET_AGE_GROUPS:
         for course in ["SCY", "LCM", "SCM"]:
-            records = cazar_records_usms(age, course)
-            if records:
-                try:
-                    # Upsert usando conflict en columnas clave
-                    response = supabase.table("records_standards").upsert(records, on_conflict="category, gender, pool_length, stroke, distance, record_type").execute()
-                    # print(f"      💉 Guardados en DB.")
-                    total_injected += len(records)
-                except Exception as db_err:
-                    print(f"      🔥 Error DB: {db_err}")
-            else:
-                print(f"      💨 Sin datos.")
+            for sex in ["M", "F"]:
+                records = cazar_records_usms(age, course, sex)
+                if records:
+                    try:
+                        # Upsert
+                        response = supabase.table("records_standards").upsert(records, on_conflict="category, gender, pool_length, stroke, distance, record_type").execute()
+                        total_injected += len(records)
+                    except Exception as db_err:
+                        print(f"      🔥 Error DB: {db_err}")
+                else:
+                    pass # Silencioso si no encuentra para no ensuciar log
 
-    print(f"\n🏆 Misión Cumplida V3. Total presas capturadas: {total_injected}")
+    print(f"\n🏆 Misión Cumplida V3.1. Total presas capturadas: {total_injected}")
 
 if __name__ == "__main__":
     ejecutar_caceria()
