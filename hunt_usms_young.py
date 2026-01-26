@@ -18,16 +18,28 @@ HEADERS = {
     'Referer': 'https://www.usms.org/'
 }
 
-def clean_time(time_str):
+def clean_time_seconds(time_str):
+    """Convierte string de tiempo a segundos flotantes"""
     if not time_str or pd.isna(time_str): return None
     try:
-        t_str = str(time_str).split()[0].strip()
+        t_str = str(time_str).split()[0].strip() # Quita 'NV' u otros sufijos
         t_str = ''.join(c for c in t_str if c.isdigit() or c in ['.', ':'])
+        
         if ':' in t_str:
             parts = t_str.split(':')
             if len(parts) == 2: return float(parts[0])*60 + float(parts[1])
             elif len(parts) == 3: return float(parts[0])*3600 + float(parts[1])*60 + float(parts[2])
         return float(t_str)
+    except: return None
+
+def format_time_clock(seconds):
+    """Convierte segundos flotantes a formato SQL TIME (00:MM:SS.ms)"""
+    if seconds is None: return None
+    try:
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        # Formato HH:MM:SS.ms
+        return "{:02d}:{:02d}:{:05.2f}".format(int(h), int(m), s)
     except: return None
 
 def cazar_records_usms(age_group, course_code, gender_code):
@@ -49,12 +61,13 @@ def cazar_records_usms(age_group, course_code, gender_code):
             count_table = 0
             for _, row in df.iterrows():
                 evt = row.get('event', '')
-                time_val = row.get('time', '')
+                time_raw = row.get('time', '')
                 name = row.get('name', '')
                 date_val = row.get('date', None)
                 
-                if pd.isna(evt) or pd.isna(time_val) or "Relay" in str(evt): continue
+                if pd.isna(evt) or pd.isna(time_raw) or "Relay" in str(evt): continue
                 
+                # Parsear Distancia y Estilo
                 evt_str = str(evt)
                 dist_digits = ''.join(filter(str.isdigit, evt_str))
                 if not dist_digits: continue
@@ -67,10 +80,13 @@ def cazar_records_usms(age_group, course_code, gender_code):
                 elif "Fly" in evt_str: style = "Mariposa"
                 elif "IM" in evt_str: style = "Combinado"
                 
-                t_seg = clean_time(time_val)
+                # Conversiones de Tiempo
+                t_seg = clean_time_seconds(time_raw)
                 
                 if t_seg:
                     t_ms = int(t_seg * 1000)
+                    t_clock = format_time_clock(t_seg) # <--- LA SOLUCIÓN
+                    
                     record = {
                         "athlete_name": name,
                         "athlete_nationality": "United States",
@@ -79,19 +95,22 @@ def cazar_records_usms(age_group, course_code, gender_code):
                         "pool_length": course_code,
                         "stroke": style,
                         "distance": dist,
-                        "time_clock": str(time_val).strip(),
+                        
+                        # Guardamos el formato SQL correcto
+                        "time_clock": t_clock, 
                         "time_ms": t_ms,
+                        
                         "record_scope": "MASTER",
                         "record_type": "Récord USMS",
                         "record_date": pd.to_datetime(date_val).strftime('%Y-%m-%d') if date_val and str(date_val) != 'nan' else None,
-                        "source_name": "USMS Hunt V3.3",
+                        "source_name": "USMS Hunt V3.4",
                         "country": "United States"
                     }
                     data_to_insert.append(record)
                     count_table += 1
             
             if count_table > 0:
-                print(f"      ✅ Récords extraídos: {count_table}")
+                print(f"      ✅ Récords preparados: {count_table}")
 
     except Exception as e:
         print(f"   ❌ Error: {e}")
@@ -104,53 +123,35 @@ def ejecutar_caceria():
         for course in ["SCY", "LCM", "SCM"]:
             for sex in ["M", "F"]:
                 records = cazar_records_usms(age, course, sex)
-                if records:
-                    # ESTRATEGIA FUERZA BRUTA: Insertar de a uno. Si falla (duplicado), sigue.
-                    # Esto es lento pero infalible si no hay índices configurados para upsert masivo.
-                    # O mejor: Insertamos el lote pero pedimos a Supabase que ignore conflictos (sin upsert).
-                    
+                
+                success_count = 0
+                for r in records:
                     try:
-                        # Opción: Borrar previos de esa categoría específica para evitar duplicados "manuales"
-                        # supabase.table("records_standards").delete().eq("category", f"MASTER {age}").eq("pool_length", course).eq("gender", sex).eq("record_type", "Récord USMS").execute()
+                        # Chequeo manual de existencia
+                        existing = supabase.table("records_standards").select("id")\
+                            .eq("category", r['category'])\
+                            .eq("gender", r['gender'])\
+                            .eq("pool_length", r['pool_length'])\
+                            .eq("stroke", r['stroke'])\
+                            .eq("distance", r['distance'])\
+                            .eq("record_type", "Récord USMS")\
+                            .execute()
                         
-                        # Inserción Simple (Si falla por duplicado ID, fallará todo el bloque, así que mejor iteramos o usamos ignoreDuplicates si la lib lo soporta, pero supabase-py es básico).
-                        # Vamos a usar upsert PERO sin especificar 'on_conflict'. 
-                        # Si tu tabla tiene ID autoincremental y NO tiene unique constraints, esto creará duplicados.
-                        # Si tiene unique constraints, fallará sin el on_conflict correcto.
-                        
-                        # LA SOLUCIÓN DEFINITIVA SIN TOCAR SQL:
-                        # Verificar si existe antes de insertar.
-                        
-                        success_count = 0
-                        for r in records:
-                            try:
-                                # Chequeo manual de existencia (Lento pero seguro)
-                                existing = supabase.table("records_standards").select("id")\
-                                    .eq("category", r['category'])\
-                                    .eq("gender", r['gender'])\
-                                    .eq("pool_length", r['pool_length'])\
-                                    .eq("stroke", r['stroke'])\
-                                    .eq("distance", r['distance'])\
-                                    .eq("record_type", "Récord USMS")\
-                                    .execute()
-                                
-                                if existing.data:
-                                    # Update
-                                    supabase.table("records_standards").update(r).eq("id", existing.data[0]['id']).execute()
-                                else:
-                                    # Insert
-                                    supabase.table("records_standards").insert(r).execute()
-                                success_count += 1
-                            except Exception as e_row:
-                                print(f"         ⚠️ Error en fila: {e_row}")
-                        
-                        print(f"      💉 Procesados {success_count} registros.")
-                        total_injected += success_count
-                        
-                    except Exception as db_err:
-                        print(f"      🔥 Error DB Lote: {db_err}")
+                        if existing.data:
+                            # Update
+                            supabase.table("records_standards").update(r).eq("id", existing.data[0]['id']).execute()
+                        else:
+                            # Insert
+                            supabase.table("records_standards").insert(r).execute()
+                        success_count += 1
+                    except Exception as e_row:
+                        print(f"         ⚠️ Error en fila {r['distance']} {r['stroke']}: {e_row}")
+                
+                if success_count > 0:
+                    print(f"      💉 Procesados {success_count} registros.")
+                    total_injected += success_count
 
-    print(f"\n🏆 Misión Cumplida V3.3. Total procesados: {total_injected}")
+    print(f"\n🏆 Misión Cumplida V3.4. Total procesados: {total_injected}")
 
 if __name__ == "__main__":
     ejecutar_caceria()
