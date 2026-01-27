@@ -1,10 +1,7 @@
 import os
-import requests
-import pdfplumber
-import io
+import pandas as pd
 import re
 import datetime
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -12,204 +9,155 @@ from supabase import create_client
 load_dotenv()
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
-# URL donde CADDA publica las novedades
-BASE_URL = "https://cadda.org.ar/todas-las-novedades/"
+# Mapeo de Eventos (URL -> Nombre en DB)
+TARGETS = [
+    {
+        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_World_Aquatics_Championships_–_Qualification", 
+        "name": "Mundial Doha 2024",
+        "pool": "LCM"
+    },
+    {
+        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_Summer_Olympics_–_Qualification",
+        "name": "JJOO Paris 2024",
+        "pool": "LCM"
+    }
+    # Puedes agregar Singapur 2025 cuando la página de Wiki esté completa con la tabla
+]
 
-def time_to_seconds(time_str):
-    """Convierte '2:15.50' o '59.80' a segundos (float)."""
-    if not time_str: return None
-    clean = str(time_str).strip().replace("'", "").replace('"', '').replace(",", ".")
+def clean_wiki_time(time_str):
+    """Limpia tiempos de Wiki (ej: '22.12' o '1:46.70') -> segundos."""
+    if pd.isna(time_str) or str(time_str).strip() == "": return None
+    # Eliminar referencias de notas tipo [a], [1]
+    clean = re.sub(r'\[.*?\]', '', str(time_str)).strip()
+    
     try:
         if ':' in clean:
             parts = clean.split(':')
             return float(parts[0]) * 60 + float(parts[1])
         return float(clean)
-    except ValueError:
+    except:
         return None
 
-def normalize_event(text):
-    """Normaliza nombres de pruebas."""
-    if not text: return None
-    text = text.upper().replace("MTS", "").replace("METROS", "").replace(".", "").strip()
-    text = text.replace("CROL", "LIBRE").replace("FREE", "LIBRE")
-    text = text.replace("BACK", "ESPALDA")
-    text = text.replace("BREAST", "PECHO")
-    text = text.replace("FLY", "MARIPOSA")
-    text = text.replace("COMBINADO", "IM").replace("MEDLEY", "IM")
+def normalize_event_wiki(event_name):
+    """Normaliza 'Men's 50 metre freestyle' -> '50 Libre'"""
+    e = event_name.upper()
     
-    match = re.search(r'(\d+)\s+([A-Z]+)', text)
-    if match:
-        return f"{match.group(1)} {match.group(2)}"
-    return None
-
-def check_db_status(event_name):
-    """Consulta el estado actual del evento en la DB."""
-    try:
-        # Contamos registros existentes para este evento
-        res = supabase.table("clasificacion_corte")\
-            .select("id", count="exact")\
-            .eq("nombre_evento", event_name)\
-            .execute()
-        return res.count
-    except Exception as e:
-        print(f"⚠️ Error consultando DB: {e}")
-        return 0
-
-def find_latest_regulation_pdf():
-    """Busca automáticamente el PDF del Reglamento Nacional más reciente."""
-    print(f"🕵️  Escaneando novedades en: {BASE_URL}")
-    try:
-        resp = requests.get(BASE_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        
-        current_year = datetime.datetime.now().year
-        next_year = current_year + 1
-        
-        # Buscamos artículos
-        articles = soup.find_all('article')
-        
-        for art in articles:
-            link_tag = art.find('a')
-            if not link_tag: continue
-            
-            title = link_tag.get_text(strip=True).upper()
-            href = link_tag.get('href')
-            
-            # CRITERIO DE BÚSQUEDA
-            if "REGLAMENTO" in title and "NACIONAL" in title:
-                if str(current_year) in title or str(next_year) in title:
-                    print(f"🎯 Candidato encontrado en Web: {title}")
-                    
-                    # Entrar al post para buscar el PDF
-                    post_resp = requests.get(href, headers={'User-Agent': 'Mozilla/5.0'})
-                    post_soup = BeautifulSoup(post_resp.content, 'html.parser')
-                    
-                    pdf_links = post_soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
-                    
-                    for pdf in pdf_links:
-                        pdf_url = pdf.get('href')
-                        return pdf_url, title
-        
-        print("Build Info: No se encontraron artículos que cumplan los criterios (REGLAMENTO + NACIONAL + AÑO).")
-        return None, None
-                        
-    except Exception as e:
-        print(f"❌ Error buscando en la web: {e}")
-        return None, None
+    # Género
+    gender = 'X'
+    if "MEN" in e and "WOMEN" not in e: gender = 'M'
+    if "WOMEN" in e: gender = 'F'
     
-def process_pdf_standards(pdf_url, event_name, pool_length="LCM"):
-    print(f"⬇️  Descargando PDF: {pdf_url}")
-    response = requests.get(pdf_url)
-    if response.status_code != 200:
-        print(f"❌ Error HTTP al descargar: {response.status_code}")
+    # Distancia y Estilo
+    dist = re.search(r'(\d+)', e)
+    distance = dist.group(1) if dist else ""
+    
+    style = "LIBRE"
+    if "BACK" in e: style = "ESPALDA"
+    if "BREAST" in e: style = "PECHO"
+    if "BUTTER" in e or "FLY" in e: style = "MARIPOSA"
+    if "MEDLEY" in e or "INDIVIDUAL" in e: style = "IM"
+    
+    # Prueba final
+    prueba_clean = f"{distance} {style}"
+    
+    return gender, prueba_clean
+
+def scrape_wiki_standards(target):
+    print(f"🌍 Scrapeando Wiki: {target['name']}...")
+    
+    try:
+        # Pandas lee todas las tablas de la URL
+        tables = pd.read_html(target['url'])
+    except Exception as e:
+        print(f"❌ Error leyendo HTML: {e}")
         return
 
-    # 1. DIAGNÓSTICO PREVIO (DB)
-    db_count = check_db_status(event_name)
-    print(f"📊 Estado DB para '{event_name}': {db_count} registros existentes.")
-
-    records_to_insert = []
+    records = []
     
-    # 2. EXTRACCIÓN (PDF)
-    try:
-        with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-            print(f"📄 Analizando {len(pdf.pages)} páginas del documento...")
-            
-            for page_num, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                if not tables:
-                    continue
-                    
-                for table in tables:
-                    header_row = None
-                    category_map = {} 
-                    
-                    # Detección dinámica de columnas
-                    for row in table:
-                        row_text = [str(c).upper() for c in row if c]
-                        if any(x in str(row_text) for x in ['CADETE', 'JUVENIL', 'MAYOR', 'OPEN', 'MENOR', 'PRIMERA']):
-                            header_row = row
-                            for col_idx, cell in enumerate(row):
-                                if cell:
-                                    clean_cat = cell.replace("\n", " ").upper().strip()
-                                    if "PRUEBA" not in clean_cat and "DISTANCIA" not in clean_cat:
-                                        category_map[col_idx] = clean_cat
-                            break
-                    
-                    if not category_map: 
-                        # Si encontramos tabla pero no cabecera válida, seguimos
-                        continue
-
-                    # Extracción de Tiempos
-                    for row in table:
-                        if not row or len(row) < 1: continue
-                        raw_event = row[0]
-                        event = normalize_event(raw_event)
-                        
-                        if not event: continue 
-                        
-                        for col_idx, category in category_map.items():
-                            if col_idx < len(row):
-                                raw_time = row[col_idx]
-                                seconds = time_to_seconds(raw_time)
-                                
-                                if seconds:
-                                    record = {
-                                        "nombre_evento": event_name,
-                                        "tipo_corte": "Marca Clasificatoria",
-                                        "categoria": category,
-                                        "genero": 'X', 
-                                        "prueba": event,
-                                        "piscina": pool_length,
-                                        "tiempo_s": seconds,
-                                        "tiempo_display": str(raw_time).strip(),
-                                        "temporada": datetime.datetime.now().year
-                                    }
-                                    records_to_insert.append(record)
-    except Exception as e:
-        print(f"❌ Error crítico leyendo el PDF (pdfplumber): {e}")
-        return
-
-    extracted_count = len(records_to_insert)
-    print(f"🔍 Resultado Extracción: Se encontraron {extracted_count} tiempos válidos en el PDF.")
-
-    # 3. LÓGICA DE COMPARACIÓN Y DECISIÓN
-    if extracted_count == 0:
-        print("⚠️ ALERTA: El PDF se descargó pero no se extrajo NADA.")
-        print("   -> Posible cambio de formato en la tabla del PDF.")
-        print("   -> No se tocará la Base de Datos para evitar borrar datos viejos por error.")
-        return
-
-    if extracted_count > 0:
-        # Si ya hay datos y son similares en cantidad, quizás no haga falta tocar nada
-        # Pero como pueden cambiar centésimas, forzamos la actualización si hay extracción exitosa.
+    for df in tables:
+        # Heurística: Buscar tablas que tengan columnas de tiempos ("Time", "Standard", "OQT")
+        # Y filas con nombres de pruebas ("Freestyle", "Backstroke")
         
-        print(f"🚀 Procediendo a actualizar DB...")
+        # Convertir todo a string para buscar keywords
+        df_str = df.to_string().upper()
         
-        try:
-            # Borrado seguro: Solo si tenemos datos nuevos para poner
-            if db_count > 0:
-                print(f"🗑️  Borrando {db_count} registros antiguos de '{event_name}'...")
-                supabase.table("clasificacion_corte").delete().eq("nombre_evento", event_name).execute()
+        if "FREE" in df_str and ("OQT" in df_str or "STANDARD" in df_str or "TIME" in df_str):
+            print("   -> Tabla de tiempos detectada.")
             
-            # Inserción
-            batch_size = 50
-            print(f"💉 Insertando {extracted_count} nuevos registros...")
-            for i in range(0, extracted_count, batch_size):
-                batch = records_to_insert[i:i+batch_size]
-                supabase.table("clasificacion_corte").insert(batch).execute()
+            # Iterar filas
+            # La estructura de Wiki suele ser: Event | Men OQT | Men OCT | Women OQT | Women OCT
+            # O a veces: Event | Time (Men) | Time (Women)
+            
+            # Detectamos columnas
+            cols = [str(c).upper() for c in df.columns]
+            
+            # Caso 1: Columnas separadas por Género y Tipo (La más común en JJOO/Mundiales)
+            # Buscamos índices
+            idx_men_a = -1
+            idx_women_a = -1
+            
+            for i, col in enumerate(cols):
+                if "MEN" in col and ("OQT" in col or "A STANDARD" in col or "TIME" in col): idx_men_a = i
+                if "WOMEN" in col and ("OQT" in col or "A STANDARD" in col or "TIME" in col): idx_women_a = i
+            
+            if idx_men_a == -1 and idx_women_a == -1: continue
+
+            for index, row in df.iterrows():
+                raw_event = str(row[0]).upper() # Asumimos col 0 es el evento
                 
-            print("✅ ACTUALIZACIÓN EXITOSA: Base de datos sincronizada.")
-            
-        except Exception as e:
-            print(f"❌ Error escribiendo en Supabase: {e}")
+                # Ignorar filas basura
+                if "EVENT" in raw_event or "METRE" not in raw_event and "FREESTYLE" not in raw_event: 
+                    # A veces wiki pone solo "50 m freestyle", validamos
+                    if not re.search(r'\d+', raw_event): continue
+
+                # Normalizar nombre base (sin genero, el genero lo da la columna)
+                _, prueba = normalize_event_wiki(raw_event)
+                
+                # Extraer Hombres
+                if idx_men_a != -1:
+                    t_val = row[idx_men_a]
+                    sec = clean_wiki_time(t_val)
+                    if sec:
+                        records.append({
+                            "nombre_evento": target['name'],
+                            "tipo_corte": "OQT / Marca A", # O "Marca A"
+                            "categoria": "OPEN",
+                            "genero": "M",
+                            "prueba": prueba,
+                            "piscina": target['pool'],
+                            "tiempo_s": sec,
+                            "tiempo_display": str(t_val),
+                            "temporada": datetime.datetime.now().year
+                        })
+
+                # Extraer Mujeres
+                if idx_women_a != -1:
+                    t_val = row[idx_women_a]
+                    sec = clean_wiki_time(t_val)
+                    if sec:
+                        records.append({
+                            "nombre_evento": target['name'],
+                            "tipo_corte": "OQT / Marca A",
+                            "categoria": "OPEN",
+                            "genero": "F",
+                            "prueba": prueba,
+                            "piscina": target['pool'],
+                            "tiempo_s": sec,
+                            "tiempo_display": str(t_val),
+                            "temporada": datetime.datetime.now().year
+                        })
+
+    # Inserción (Upsert lógico)
+    if records:
+        print(f"🚀 Insertando {len(records)} marcas internacionales...")
+        # Borrar viejos para este evento
+        supabase.table("clasificacion_corte").delete().eq("nombre_evento", target['name']).execute()
+        # Insertar nuevos
+        supabase.table("clasificacion_corte").insert(records).execute()
+        print("✅ Hecho.")
+    else:
+        print("⚠️ No se extrajeron datos. Revisa la estructura de la tabla Wiki.")
 
 if __name__ == "__main__":
-    url, title = find_latest_regulation_pdf()
-    
-    if url:
-        print(f"✅ Se procederá a procesar: {title}")
-        pool = "SCM" if "CORTA" in title else "LCM"
-        process_pdf_standards(url, title, pool)
-    else:
-        print("zzz No se encontró ningún reglamento nuevo para procesar hoy.")
+    for t in TARGETS:
+        scrape_wiki_standards(t)
