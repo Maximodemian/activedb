@@ -52,7 +52,6 @@ def check_db_status(event_name):
 
 def clean_time_generic(time_str):
     if pd.isna(time_str) or str(time_str).strip() == "": return None
-    # Limpieza: quitar notas [a], paréntesis y espacios
     clean = re.sub(r'\[.*?\]', '', str(time_str))
     clean = re.sub(r'\(.*?\)', '', clean)
     clean = clean.replace("'", "").replace('"', '').replace(",", ".").strip()
@@ -101,62 +100,58 @@ def process_international_targets():
         records = []
         
         for i, df in enumerate(tables):
-            # --- 1. APLANAR COLUMNAS (Flat Headers) ---
-            # Convierte MultiIndex ('Men', 'OQT') en string "MEN OQT"
+            # --- 1. APLANAR COLUMNAS ---
+            # Convierte headers complejos en texto plano
             clean_cols = []
             for col in df.columns:
                 if isinstance(col, tuple):
-                    clean_cols.append(" ".join([str(c) for c in col]).upper())
+                    # Unimos niveles, ignorando 'Unnamed'
+                    parts = [str(c) for c in col if "Unnamed" not in str(c)]
+                    clean_cols.append(" ".join(parts).upper())
                 else:
                     clean_cols.append(str(col).upper())
             
             df.columns = clean_cols
-            df_str = df.to_string().upper()
             
-            # --- 2. DETECTOR DE TABLA (Keywords) ---
-            keywords_time = ["OQT", "OCT", "STANDARD", "QUALIFYING TIME", "A CUT", "TIME"]
-            keywords_event = ["EVENT", "PRUEBA", "DISTANCE"]
-            
-            has_event = any(k in str(clean_cols) for k in keywords_event)
-            has_time = any(k in str(clean_cols) or k in df_str for k in keywords_time)
-            
-            if not (has_event and has_time):
-                continue
-
-            # --- 3. MAPEO DE COLUMNAS ---
+            # --- 2. DETECTOR DE COLUMNAS (DEBUG MODE) ---
+            # Palabras clave ampliadas
             idx_event = -1
             idx_men = -1
             idx_women = -1
             
-            for idx, col_name in enumerate(clean_cols):
-                # Buscar columna de Evento
-                if "EVENT" in col_name and idx_event == -1:
+            # Buscamos Evento
+            for idx, c in enumerate(clean_cols):
+                if any(x in c for x in ["EVENT", "DISTANCE", "PRUEBA"]):
                     idx_event = idx
-                
-                # Buscar columna Hombres
-                if "MEN" in col_name and "WOMEN" not in col_name:
-                    if any(k in col_name for k in ["OQT", "STANDARD", "TIME", "A CUT"]):
-                        idx_men = idx
-                
-                # Buscar columna Mujeres
-                if "WOMEN" in col_name:
-                    if any(k in col_name for k in ["OQT", "STANDARD", "TIME", "A CUT"]):
-                        idx_women = idx
+                    break
+            if idx_event == -1: idx_event = 0 # Default a la primera
 
-            # Fallback: Si no encuentro 'Event' header, asumo columna 0
-            if idx_event == -1: idx_event = 0
+            # Buscamos Hombres y Mujeres con lógica laxa
+            # Buscamos "MEN" + algo de tiempo, o si la tabla es simple, buscamos "TIME" en columnas separadas
+            for idx, c in enumerate(clean_cols):
+                is_men = "MEN" in c and "WOMEN" not in c
+                is_women = "WOMEN" in c
+                
+                # Palabras que indican tiempo
+                is_time = any(x in c for x in ["OQT", "OCT", "STANDARD", "TIME", "A CUT", "ENTRY"])
+                
+                # Prioridad 1: "MEN OQT" o "MEN TIME"
+                if is_men and is_time: idx_men = idx
+                if is_women and is_time: idx_women = idx
 
-            # DEBUG: Si falla la detección de columnas de tiempo, imprimir qué vimos
+            # DEBUG CRÍTICO: Imprimir qué columnas ve si falla la detección
             if idx_men == -1 and idx_women == -1:
-                # print(f"   ⚠️ Tabla detectada pero sin columnas claras de sexo. Cols: {clean_cols}")
+                # Solo imprimimos si parece una tabla de natación (tiene Freestyle o similar)
+                content = df.to_string().upper()
+                if "FREE" in content or "MEDLEY" in content:
+                    print(f"   ⚠️ [DEBUG] Tabla {i} ignorada. Columnas encontradas: {clean_cols}")
                 continue
 
-            # --- 4. EXTRACCIÓN DE FILAS ---
-            rows_extracted = 0
+            # --- 3. EXTRACCIÓN ---
             for index, row in df.iterrows():
                 raw_event = str(row[idx_event]).upper()
                 
-                # Validación básica: debe tener números (ej: "50m")
+                # Validación básica: debe tener números
                 if not re.search(r'\d+', raw_event): continue 
                 
                 _, prueba = normalize_event_wiki(raw_event)
@@ -177,7 +172,6 @@ def process_international_targets():
                             "tiempo_display": str(val),
                             "temporada": datetime.datetime.now().year
                         })
-                        rows_extracted += 1
                 
                 # Mujeres
                 if idx_women != -1:
@@ -195,9 +189,7 @@ def process_international_targets():
                             "tiempo_display": str(val),
                             "temporada": datetime.datetime.now().year
                         })
-                        rows_extracted += 1
 
-        # RESULTADOS
         if records:
             print(f"   🚀 ÉXITO en {target['name']}: {len(records)} tiempos. Actualizando DB...")
             try:
@@ -207,7 +199,7 @@ def process_international_targets():
             except Exception as e:
                 print(f"   ❌ Error escritura DB: {e}")
         else:
-            print(f"   ⚠️ {target['name']}: No se extrajeron filas válidas (Revisar log debug).")
+            print(f"   ⚠️ {target['name']}: No se extrajeron filas (Revisar logs DEBUG arriba).")
 
 # ==============================================================================
 # LÓGICA NACIONAL (CADDA)
@@ -316,7 +308,7 @@ def process_cadda_regulation():
         print("   ⚠️ PDF descargado pero sin datos extraíbles.")
 
 if __name__ == "__main__":
-    print("🚀 INICIANDO SCRAPER UNIFICADO (V3.1)")
+    print("🚀 INICIANDO SCRAPER UNIFICADO (V4.0 - DEBUG)")
     process_international_targets()
     process_cadda_regulation()
     print("\n🏁 Proceso finalizado.")
