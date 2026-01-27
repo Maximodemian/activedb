@@ -12,7 +12,6 @@ on:
         required: false
         default: "true"
   schedule:
-    # Lunes 09:00 UTC = 06:00 Argentina (UTC-3)
     - cron: "0 9 * * 1"
 
 jobs:
@@ -49,19 +48,18 @@ jobs:
       - name: Run Open Scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_KEY }}
           SCOPE: ${{ github.event.inputs.scope }}
           UPSERT: ${{ github.event.inputs.upsert }}
         run: |
           set -euo pipefail
 
-          # Validación de secrets (si faltan, que falle claro)
           if [ -z "${SUPABASE_URL:-}" ]; then
             echo "::error::Falta secret SUPABASE_URL"
             exit 3
           fi
           if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
-            echo "::error::Falta secret SUPABASE_SERVICE_ROLE_KEY"
+            echo "::error::Falta secret SUPABASE_KEY (se usa como SUPABASE_SERVICE_ROLE_KEY)"
             exit 3
           fi
 
@@ -70,8 +68,6 @@ jobs:
             RUN_ARGS="--run usa_2024_2028_age_group"
           elif [ "${SCOPE:-all}" = "cadda" ]; then
             RUN_ARGS="--run cadda_minimas_2023_2024"
-          else
-            RUN_ARGS=""
           fi
 
           UPSERT_ARG=""
