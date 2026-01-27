@@ -26,10 +26,8 @@ jobs:
 
       - name: Debug list repo root
         run: |
-          set -euo pipefail
           echo "PWD: $(pwd)"
           ls -la
-          test -f scrape_open_standards.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
