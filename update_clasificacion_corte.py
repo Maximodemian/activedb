@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import pdfplumber
 import io
@@ -9,24 +10,28 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client
 
+# --- 0. CORRECCIÓN DE ENCODING (CRÍTICO PARA GITHUB ACTIONS) ---
+# Fuerza a la salida de consola a usar UTF-8 para evitar errores con tildes o caracteres raros
+sys.stdout.reconfigure(encoding='utf-8')
+
 # --- CONFIGURACIÓN GLOBAL ---
 load_dotenv()
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 # 1. FUENTES INTERNACIONALES (Wikipedia/Webs)
-# Agrega aquí nuevos mundiales o JJOO a medida que salgan
+# NOTA: Las URLs de Wikipedia usan el "en-dash" (–). Para evitar errores de ASCII en Linux,
+# lo reemplazamos por su código URL: %E2%80%93
 INTERNATIONAL_TARGETS = [
     {
-        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_World_Aquatics_Championships_–_Qualification", 
+        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_World_Aquatics_Championships_%E2%80%93_Qualification", 
         "name": "Mundial Doha 2024",
         "pool": "LCM"
     },
     {
-        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_Summer_Olympics_–_Qualification",
+        "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_Summer_Olympics_%E2%80%93_Qualification",
         "name": "JJOO Paris 2024",
         "pool": "LCM"
     }
-    # Futuro: "Mundial Singapur 2025"
 ]
 
 # 2. FUENTE NACIONAL (CADDA)
@@ -96,6 +101,7 @@ def process_international_targets():
     for target in INTERNATIONAL_TARGETS:
         print(f"🌍 Scrapeando: {target['name']}...")
         try:
+            # Pandas usa lxml o bs4 bajo cuerda. Al darle la URL codificada (%E2%80%93) evitamos el crash ASCII.
             tables = pd.read_html(target['url'])
         except Exception as e:
             print(f"❌ Error leyendo HTML: {e}")
