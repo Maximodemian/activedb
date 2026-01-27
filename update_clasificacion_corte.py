@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 # --- 0. CORRECCIÓN DE ENCODING (CRÍTICO PARA GITHUB ACTIONS) ---
-# Fuerza a la salida de consola a usar UTF-8 para evitar errores con tildes o caracteres raros
+# Fuerza a la salida de consola a usar UTF-8 para evitar errores con tildes
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIGURACIÓN GLOBAL ---
@@ -19,8 +19,7 @@ load_dotenv()
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 # 1. FUENTES INTERNACIONALES (Wikipedia/Webs)
-# NOTA: Las URLs de Wikipedia usan el "en-dash" (–). Para evitar errores de ASCII en Linux,
-# lo reemplazamos por su código URL: %E2%80%93
+# Usamos URLs codificadas para evitar problemas de caracteres raros
 INTERNATIONAL_TARGETS = [
     {
         "url": "https://en.wikipedia.org/wiki/Swimming_at_the_2024_World_Aquatics_Championships_%E2%80%93_Qualification", 
@@ -36,6 +35,12 @@ INTERNATIONAL_TARGETS = [
 
 # 2. FUENTE NACIONAL (CADDA)
 CADDA_BASE_URL = "https://cadda.org.ar/todas-las-novedades/"
+
+# --- HEADER PARA ENGAÑAR A WIKIPEDIA (Evita Error 403) ---
+FAKE_BROWSER_HEADER = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
 
 # ==============================================================================
@@ -101,8 +106,13 @@ def process_international_targets():
     for target in INTERNATIONAL_TARGETS:
         print(f"🌍 Scrapeando: {target['name']}...")
         try:
-            # Pandas usa lxml o bs4 bajo cuerda. Al darle la URL codificada (%E2%80%93) evitamos el crash ASCII.
-            tables = pd.read_html(target['url'])
+            # 1. SOLICITUD HTTP CON HEADERS (La clave para evitar el 403)
+            response = requests.get(target['url'], headers=FAKE_BROWSER_HEADER)
+            response.raise_for_status() # Lanza error si falla la conexión
+            
+            # 2. PANDAS LEE EL TEXTO YA DESCARGADO (Usando StringIO)
+            tables = pd.read_html(io.StringIO(response.text))
+            
         except Exception as e:
             print(f"❌ Error leyendo HTML: {e}")
             continue
@@ -127,7 +137,7 @@ def process_international_targets():
 
                 for index, row in df.iterrows():
                     raw_event = str(row[0]).upper()
-                    if not re.search(r'\d+', raw_event): continue # Saltar si no tiene números (ej: headers intermedios)
+                    if not re.search(r'\d+', raw_event): continue 
 
                     _, prueba = normalize_event_wiki(raw_event)
                     
@@ -167,14 +177,14 @@ def process_international_targets():
         if records:
             print(f"   🚀 Encontrados {len(records)} registros. Actualizando DB...")
             try:
-                # Borrar y reescribir (Estrategia segura para listas completas)
+                # Borrar y reescribir
                 supabase.table("clasificacion_corte").delete().eq("nombre_evento", target['name']).execute()
                 supabase.table("clasificacion_corte").insert(records).execute()
                 print("   ✅ Actualizado.")
             except Exception as e:
                 print(f"   ❌ Error DB: {e}")
         else:
-            print("   ⚠️ No se extrajeron datos de esta URL.")
+            print("   ⚠️ No se extrajeron datos de esta URL (¿Cambió el formato?).")
 
 
 # ==============================================================================
@@ -199,7 +209,8 @@ def normalize_event_cadda(text):
 def find_cadda_pdf():
     print(f"🕵️  Buscando reglamentos en: {CADDA_BASE_URL}")
     try:
-        resp = requests.get(CADDA_BASE_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        # Usamos los mismos headers para CADDA por si acaso
+        resp = requests.get(CADDA_BASE_URL, headers=FAKE_BROWSER_HEADER)
         soup = BeautifulSoup(resp.content, 'html.parser')
         
         current_year = datetime.datetime.now().year
@@ -218,7 +229,7 @@ def find_cadda_pdf():
                 if str(current_year) in title or str(next_year) in title:
                     print(f"   🎯 Candidato: {title}")
                     
-                    post_resp = requests.get(href, headers={'User-Agent': 'Mozilla/5.0'})
+                    post_resp = requests.get(href, headers=FAKE_BROWSER_HEADER)
                     post_soup = BeautifulSoup(post_resp.content, 'html.parser')
                     
                     pdf_links = post_soup.find_all('a', href=re.compile(r'\.pdf$', re.I))
@@ -247,7 +258,7 @@ def process_cadda_regulation():
     records_to_insert = []
     
     try:
-        resp = requests.get(pdf_url)
+        resp = requests.get(pdf_url, headers=FAKE_BROWSER_HEADER)
         with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
             print(f"   📄 Leyendo {len(pdf.pages)} páginas...")
             
@@ -300,7 +311,6 @@ def process_cadda_regulation():
     extracted_count = len(records_to_insert)
     print(f"   🔍 Se extrajeron {extracted_count} tiempos válidos del PDF.")
 
-    # Seguridad: Solo actualizamos si leímos algo
     if extracted_count > 0:
         print(f"   🚀 Actualizando base de datos...")
         try:
@@ -315,7 +325,7 @@ def process_cadda_regulation():
         except Exception as e:
             print(f"   ❌ Error escritura DB: {e}")
     else:
-        print("   ⚠️ El PDF se descargó pero no se extrajeron datos (formato desconocido). No se toca la DB.")
+        print("   ⚠️ El PDF se descargó pero no se extrajeron datos. No se toca la DB.")
 
 
 # ==============================================================================
@@ -323,12 +333,9 @@ def process_cadda_regulation():
 # ==============================================================================
 
 if __name__ == "__main__":
-    print("🚀 INICIANDO SCRAPER DE CORTES Y CLASIFICACIÓN (Unified)")
+    print("🚀 INICIANDO SCRAPER DE CORTES Y CLASIFICACIÓN (Unified V2.1)")
     
-    # 1. Procesar Internacionales
     process_international_targets()
-    
-    # 2. Procesar Nacional (CADDA)
     process_cadda_regulation()
     
     print("\n🏁 Proceso finalizado.")
