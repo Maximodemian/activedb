@@ -18,6 +18,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -33,13 +34,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y default-jre
+          java -version
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (global requirements)
         run: |
           python -m pip install --upgrade pip
-          pip install -r scrapers/open/requirements_open_scraper.txt
+          pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run Open Scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -65,7 +67,7 @@ jobs:
           echo "Running: python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}"
           python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}
 
-      - name: Upload outputs (debug / parsed json)
+      - name: Upload outputs (debug / parsed json / pdfs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
