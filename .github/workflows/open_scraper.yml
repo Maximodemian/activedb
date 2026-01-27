@@ -1,0 +1,77 @@
+name: Open Scraper (USA + CADDA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Qué correr: all | usa | cadda"
+        required: false
+        default: "all"
+      upsert:
+        description: "Hacer UPSERT a Supabase (true/false)"
+        required: false
+        default: "true"
+  schedule:
+    # Lunes 09:00 UTC = 06:00 Argentina (UTC-3)
+    - cron: "0 9 * * 1"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Java (tabula-py requiere JRE)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scrapers/open/requirements_open_scraper.txt
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCOPE: ${{ github.event.inputs.scope }}
+          UPSERT: ${{ github.event.inputs.upsert }}
+        run: |
+          set -euo pipefail
+
+          RUN_ARGS=""
+          if [ "${SCOPE:-all}" = "usa" ]; then
+            RUN_ARGS="--run usa_2024_2028_age_group"
+          elif [ "${SCOPE:-all}" = "cadda" ]; then
+            RUN_ARGS="--run cadda_minimas_2023_2024"
+          else
+            RUN_ARGS=""
+          fi
+
+          UPSERT_ARG=""
+          if [ "${UPSERT:-true}" = "true" ]; then
+            UPSERT_ARG="--upsert"
+          fi
+
+          echo "Running: python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}"
+          python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}
+
+      - name: Upload outputs (debug / parsed json)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-scraper-output
+          path: |
+            out/parsed_rows.json
+            out/debug/**
+            out/pdfs/**
+          if-no-files-found: ignore
