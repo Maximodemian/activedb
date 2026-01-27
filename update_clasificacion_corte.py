@@ -52,9 +52,9 @@ def check_db_status(event_name):
 
 def clean_time_generic(time_str):
     if pd.isna(time_str) or str(time_str).strip() == "": return None
-    # Limpieza: quitar notas [a], paréntesis y espacios
-    clean = re.sub(r'\[.*?\]', '', str(time_str))
-    clean = re.sub(r'\(.*?\)', '', clean) # Quita (heats) o similares
+    # Limpieza agresiva
+    clean = re.sub(r'\[.*?\]', '', str(time_str)) # Quita [a]
+    clean = re.sub(r'\(.*?\)', '', clean) # Quita (heats)
     clean = clean.replace("'", "").replace('"', '').replace(",", ".").strip()
     try:
         if ':' in clean:
@@ -68,11 +68,11 @@ def normalize_event_wiki(event_name):
     e = str(event_name).upper()
     gender = 'X'
     
-    # Detección de Género en el nombre del evento
-    # Ej: "MEN'S 50M FREESTYLE" -> M
+    # 1. Intentar detectar género en el nombre del evento
     if "MEN" in e and "WOMEN" not in e: gender = 'M'
     if "WOMEN" in e: gender = 'F'
     
+    # 2. Extraer distancia y estilo
     dist = re.search(r'(\d+)', e)
     distance = dist.group(1) if dist else ""
     
@@ -84,12 +84,28 @@ def normalize_event_wiki(event_name):
     
     return gender, f"{distance} {style}"
 
+def infer_gender_from_table_data(df, idx_event, idx_time):
+    """
+    HEURÍSTICA: Si la tabla no tiene título de género, miramos los tiempos.
+    - 50m Libre Hombres < 23s
+    - 50m Libre Mujeres > 23.5s
+    """
+    for index, row in df.iterrows():
+        raw_event = str(row[idx_event]).upper()
+        if "50" in raw_event and ("FREE" in raw_event or "LIBRE" in raw_event):
+            val = row[idx_time]
+            sec = clean_time_generic(val)
+            if sec:
+                if sec < 23.0: return 'M'
+                if sec > 23.5: return 'F'
+    return 'X' # No se pudo determinar
+
 # ==============================================================================
 # LÓGICA INTERNACIONAL (WIKIPEDIA)
 # ==============================================================================
 
 def process_international_targets():
-    print("\n🌐 --- INICIANDO ACTUALIZACIÓN INTERNACIONAL ---")
+    print("\n🌐 --- INICIANDO ACTUALIZACIÓN INTERNACIONAL (V6.0 Heurística) ---")
     
     for target in INTERNATIONAL_TARGETS:
         print(f"🌍 Scrapeando: {target['name']}...")
@@ -104,7 +120,7 @@ def process_international_targets():
         records = []
         
         for i, df in enumerate(tables):
-            # --- 1. APLANAR COLUMNAS ---
+            # Aplanar columnas
             clean_cols = []
             for col in df.columns:
                 if isinstance(col, tuple):
@@ -114,69 +130,62 @@ def process_international_targets():
                     clean_cols.append(str(col).upper())
             df.columns = clean_cols
             
-            # --- 2. DETECTOR DE TABLA (V5 - Flexible) ---
-            # Buscamos columnas clave
+            # Detectar columnas clave
             idx_event = -1
-            idx_time = -1 # Columna donde está el tiempo (Generic)
-            idx_men_time = -1 # Columna específica hombres
-            idx_women_time = -1 # Columna específica mujeres
+            idx_time = -1 
+            idx_men_time = -1
+            idx_women_time = -1
             
             for idx, col in enumerate(clean_cols):
-                # Buscar Evento
-                if any(k in col for k in ["EVENT", "PRUEBA", "DISTANCE"]):
-                    idx_event = idx
+                if any(k in col for k in ["EVENT", "PRUEBA", "DISTANCE"]): idx_event = idx
                 
-                # Buscar Tiempos Específicos (Prioridad Alta)
                 is_time_col = any(k in col for k in ["OQT", "STANDARD", "TIME", "A CUT"])
                 if "MEN" in col and "WOMEN" not in col and is_time_col: idx_men_time = idx
                 if "WOMEN" in col and is_time_col: idx_women_time = idx
-                
-                # Buscar Tiempo Genérico (Prioridad Baja - Para tablas EVENT | OQT)
-                if is_time_col and idx_men_time == -1 and idx_women_time == -1:
-                    idx_time = idx
+                if is_time_col and idx_men_time == -1 and idx_women_time == -1: idx_time = idx
 
-            # Si no encontramos evento, asumimos col 0
             if idx_event == -1: idx_event = 0
             
-            # Validación: ¿Es una tabla útil?
-            has_valid_time_col = (idx_time != -1) or (idx_men_time != -1) or (idx_women_time != -1)
+            # --- ESTRATEGIA DE EXTRACCIÓN ---
+            table_gender = 'X'
             
-            if not has_valid_time_col:
-                # Debug silencioso: ignoramos tablas de medallas o calendarios
-                continue
+            # Caso 1: Columnas explícitas (Men/Women)
+            if idx_men_time != -1 or idx_women_time != -1:
+                # Procesamos normal, ignoramos heurística
+                pass
+            
+            # Caso 2: Tabla genérica (Event | Time) sin género en header
+            elif idx_time != -1:
+                # Intentamos adivinar el género de la TABLA ENTERA usando los 50m Libre
+                table_gender = infer_gender_from_table_data(df, idx_event, idx_time)
+                # Si falló, quizás el género está en cada fila (row-level)
 
-            # --- 3. EXTRACCIÓN ---
+            # Iterar filas
             for index, row in df.iterrows():
                 raw_event = str(row[idx_event]).upper()
-                
-                # Debe tener número (distancia)
                 if not re.search(r'\d+', raw_event): continue 
                 
-                gender_from_row, prueba = normalize_event_wiki(raw_event)
+                row_gender, prueba = normalize_event_wiki(raw_event)
                 
-                # CASO A: Tabla con columnas separadas (Men/Women Headers)
-                if idx_men_time != -1:
-                    val = row[idx_men_time]
-                    sec = clean_time_generic(val)
-                    if sec:
-                        records.append(build_record(target, "M", prueba, sec, val))
+                # Prioridad de Género: Fila > Tabla detectada > 'X'
+                final_gender = row_gender if row_gender != 'X' else table_gender
 
+                # Extracción Hombres (Columna explícita)
+                if idx_men_time != -1:
+                    sec = clean_time_generic(row[idx_men_time])
+                    if sec: records.append(build_record(target, "M", prueba, sec, row[idx_men_time]))
+
+                # Extracción Mujeres (Columna explícita)
                 if idx_women_time != -1:
-                    val = row[idx_women_time]
-                    sec = clean_time_generic(val)
-                    if sec:
-                        records.append(build_record(target, "F", prueba, sec, val))
+                    sec = clean_time_generic(row[idx_women_time])
+                    if sec: records.append(build_record(target, "F", prueba, sec, row[idx_women_time]))
                 
-                # CASO B: Tabla genérica (EVENT | OQT), el género viene de la fila
+                # Extracción Genérica (Columna Time + Género inferido)
                 if idx_time != -1 and idx_men_time == -1 and idx_women_time == -1:
-                    # Solo insertamos si pudimos detectar género en la fila
-                    if gender_from_row in ['M', 'F']:
+                    if final_gender in ['M', 'F']:
                         val = row[idx_time]
                         sec = clean_time_generic(val)
-                        if sec:
-                             records.append(build_record(target, gender_from_row, prueba, sec, val))
-                    # Si gender_from_row es 'X', a veces Wiki pone "Men's 50m..." y luego "Women's..."
-                    # pero si la fila dice solo "50m Freestyle" y el header no dice nada, ignoramos por seguridad.
+                        if sec: records.append(build_record(target, final_gender, prueba, sec, val))
 
         if records:
             print(f"   🚀 ÉXITO en {target['name']}: {len(records)} tiempos. Actualizando DB...")
@@ -187,11 +196,10 @@ def process_international_targets():
             except Exception as e:
                 print(f"   ❌ Error escritura DB: {e}")
         else:
-            # Mensaje diferenciado para Singapur vs Paris
             if "Paris" in target['name']:
-                 print(f"   ⚠️ {target['name']}: Tabla detectada pero no se extrajeron filas (Revisar nombres de eventos).")
+                 print(f"   ⚠️ {target['name']}: No se extrajeron filas. (La heurística de género falló o no es una tabla de tiempos).")
             else:
-                 print(f"   ℹ️  {target['name']}: Aún no hay tabla de tiempos disponible en Wiki.")
+                 print(f"   ℹ️  {target['name']}: Aún no hay tabla disponible.")
 
 def build_record(target, gender, prueba, seconds, display):
     return {
@@ -313,7 +321,7 @@ def process_cadda_regulation():
         print("   ⚠️ PDF descargado pero sin datos extraíbles.")
 
 if __name__ == "__main__":
-    print("🚀 INICIANDO SCRAPER UNIFICADO (V5.0 - Flexible)")
+    print("🚀 INICIANDO SCRAPER UNIFICADO (V6.0 - Time Detective)")
     process_international_targets()
     process_cadda_regulation()
     print("\n🏁 Proceso finalizado.")
