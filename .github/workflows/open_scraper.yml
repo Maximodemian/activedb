@@ -18,11 +18,18 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Debug list repo root
+        run: |
+          set -euo pipefail
+          echo "PWD: $(pwd)"
+          ls -la
+          test -f scrape_open_standards.py
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -50,6 +57,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Validación de secrets (si faltan, que falle claro)
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "::error::Falta secret SUPABASE_URL"
+            exit 3
+          fi
+          if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+            echo "::error::Falta secret SUPABASE_SERVICE_ROLE_KEY"
+            exit 3
+          fi
+
           RUN_ARGS=""
           if [ "${SCOPE:-all}" = "usa" ]; then
             RUN_ARGS="--run usa_2024_2028_age_group"
@@ -64,8 +81,8 @@ jobs:
             UPSERT_ARG="--upsert"
           fi
 
-          echo "Running: python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}"
-          python scrapers/open/scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}
+          echo "Running: python scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}"
+          python scrape_open_standards.py ${RUN_ARGS} ${UPSERT_ARG}
 
       - name: Upload outputs (debug / parsed json / pdfs)
         if: always()
