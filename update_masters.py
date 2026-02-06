@@ -1,483 +1,356 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-USMS Masters NQT scraper → Supabase standards_usa
+🦈 USMS Masters NQT Scraper v6.0 (PDF-first, SCY + LCM)
 
-v5.0  (SCY + LCM)  - parses the official USMS NQT page (HTML tables)
-- Inserts BOTH SCY (Spring Nationals) and LCM (Summer Nationals) NQTs when present.
-- Avoids wiping all Masters rows: deletes only the season+course being refreshed.
-- Keeps existing PDFPlumber-based functions as optional fallback.
+Motivo: USMS suele bloquear scraping HTML desde GitHub Actions (403).
+Solución: consumir PDFs oficiales (CDN azurefd) y poblar standards_usa como standard_type=MASTERS.
 
-Table destination: standards_usa
-Key fields inserted:
-  ciclo, season_year, standard_type="MASTERS", nivel="NQT",
-  genero (M/F), edad (e.g., 40-44), estilo (Libre/Espalda/Pecho/Mariposa/Combinado),
-  distancia_m, curso (SCY/LCM), tiempo_s
+Tabla destino: standards_usa
+Columnas usadas (mínimas):
+- standard_type (str)  -> "MASTERS"
+- season_year   (str)  -> "2026" / "2025" (año del meet/NQT)
+- genero        (str)  -> "M" / "F"
+- edad          (str)  -> "18-24", "25-29", ... "80-84" (sin prefijo MASTER)
+- estilo        (str)  -> "FREE","BACK","BREAST","FLY","IM"
+- distancia_m   (int)  -> 50, 100, 200, 400, 500, 800, 1000, 1500, 1650
+- nivel         (str)  -> "NQT"
+- tiempo_s      (float)-> segundos
+- curso         (str)  -> "SCY" o "LCM"
 
-Env:
-  SUPABASE_URL, SUPABASE_KEY
-  (optional for email reports) MAIL_USERNAME/EMAIL_USER, MAIL_PASSWORD/EMAIL_PASSWORD
+ENV opcional:
+- FETCH_MODE: "pdf" (default) | "auto" (idéntico en v6; siempre usa PDFs)
+- USMS_SCY_PDF_URL: override URL SCY
+- USMS_LCM_PDF_URL: override URL LCM
+- SUPABASE_URL, SUPABASE_KEY (service role recomendado)
+- MAIL_USERNAME, MAIL_PASSWORD (opcional para reporte email)
+- MAIL_TO (opcional; si no, usa MAIL_USERNAME)
 """
+
 import os
 import re
 import io
+import sys
 import datetime
 import requests
 import pdfplumber
 import smtplib
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from supabase import create_client
 
-# Optional but available in your environment; used for robust HTML table extraction
-from bs4 import BeautifulSoup
-import pandas as pd
+VERSION = "6.0"
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-load_dotenv()
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise SystemExit("Missing SUPABASE_URL / SUPABASE_KEY in environment")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-EMAIL_SENDER = os.environ.get("MAIL_USERNAME") or os.environ.get("EMAIL_USER")
-EMAIL_PASSWORD = os.environ.get("MAIL_PASSWORD") or os.environ.get("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER") or "vorrabermauro@gmail.com"
-
-USMS_NQT_URL = os.environ.get(
-    "USMS_NQT_URL",
-    "https://www.usms.org/events/national-championships/pool-national-championships/national-qualifying-times"
+# PDFs oficiales (CDN azurefd) – default robusto
+DEFAULT_SCY_PDF_URL = (
+    "https://www-usms-hhgdctfafngha6hr.z01.azurefd.net/-/media/usms/pdfs/pool%20national%20championships/"
+    "2026%20spring%20nationals/2026%20usms%20spring%20nationals%20nqts.pdf"
+)
+DEFAULT_LCM_PDF_URL = (
+    "https://www-usms-hhgdctfafngha6hr.z01.azurefd.net/-/media/usms/pdfs/pool%20national%20championships/"
+    "2025%20summer%20nationals/2025%20usms%20summer%20nationals%20nqts%20v1.pdf"
 )
 
-# Optional PDF fallback URLs (if you want to pin per year / in case HTML changes)
-PDF_URL_SCY = os.environ.get("USMS_NQT_PDF_SCY")  # e.g. "...spring nationals nqts.pdf"
-PDF_URL_LCM = os.environ.get("USMS_NQT_PDF_LCM")  # e.g. "...summer nationals nqts.pdf"
+AGE_COLS = [
+    "18-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64","65-69","70-74","75-79","80-84"
+]
 
-# Stats
-STATS = {
-    "extracted": 0,
-    "inserted": 0,
-    "male": 0,
-    "female": 0,
-    "courses": {},  # course -> count
-    "seasons": {},  # season_year -> count
-    "errors": 0,
+STYLE_MAP = {
+    "FREE": "FREE", "FREESTYLE": "FREE", "LIBRE": "FREE",
+    "BACK": "BACK", "BACKSTROKE": "BACK", "ESPALDA": "BACK",
+    "BREAST": "BREAST", "BREASTSTROKE": "BREAST", "PECHO": "BREAST",
+    "FLY": "FLY", "BUTTERFLY": "FLY", "MARIPOSA": "FLY",
+    "IM": "IM", "MEDLEY": "IM", "COMBINADO": "IM",
 }
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def enviar_reporte_email(log_body: str, status: str = "SUCCESS") -> None:
-    """Send final report via email (optional)."""
-    if not EMAIL_SENDER or not EMAIL_PASSWORD:
-        print("⚠️  Email creds not found; skipping email report.")
+def _env(key: str, default: str = "") -> str:
+    v = os.environ.get(key)
+    return v.strip() if isinstance(v, str) and v.strip() else default
+
+def send_report_email(subject: str, body: str, status: str) -> None:
+    user = _env("MAIL_USERNAME")
+    pwd = _env("MAIL_PASSWORD")
+    to = _env("MAIL_TO", user)
+    if not user or not pwd or not to:
+        print("ℹ️ Email not configured (MAIL_USERNAME/MAIL_PASSWORD/MAIL_TO). Skipping email.")
         return
+
+    msg = MIMEMultipart()
+    msg["From"] = user
+    msg["To"] = to
+    msg["Subject"] = f"[USMS_MASTERS_NQT v{VERSION}] {status} | {subject}"
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
     try:
-        msg = MIMEMultipart()
-        msg["From"] = f"Bot de Natación <{EMAIL_SENDER}>"
-        msg["To"] = EMAIL_RECEIVER
-
-        icon = "🟢" if status == "SUCCESS" else "🔴"
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg["Subject"] = f"{icon} Reporte USMS Masters NQT - {timestamp}"
-
-        body = f"""Hola Mauro,
-
-Resultado de la ejecución automática de estándares Masters (USMS NQT).
-
---------------------------------------------------
-REPORTE DE EJECUCIÓN
---------------------------------------------------
-Version: USMS_MASTERS_NQT_v5.0_MULTI_COURSE
-Timestamp: {timestamp}
-
-{log_body}
-
---------------------------------------------------
-Detalles Técnicos:
-- Origen: USMS NQT (HTML tables) + PDF fallback opcional
-- Destino: Supabase (Tabla: standards_usa)
-
-Saludos,
-Tu Ferrari de Datos 🏎️
-"""
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        server.quit()
+        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.starttls()
+            s.login(user, pwd)
+            s.sendmail(user, [to], msg.as_string())
         print("📧 Email de reporte enviado correctamente.")
     except Exception as e:
-        print(f"❌ Error enviando email: {e}")
+        print(f"⚠️ No se pudo enviar email: {e}")
 
-def clean_time(time_str) -> Optional[float]:
-    """Convert 'mm:ss.xx' or 'ss.xx' to seconds (float)."""
-    try:
-        if time_str is None:
-            return None
-        s = str(time_str).strip().replace("*", "").replace("+", "")
-        if s == "" or s.upper() in {"NO TIME", "NT"}:
-            return None
-        if ":" in s:
-            parts = s.split(":")
-            if len(parts) == 2:
-                return float(parts[0]) * 60 + float(parts[1])
-            if len(parts) == 3:
-                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-        return float(s)
-    except Exception:
+def time_to_seconds(t: str) -> float | None:
+    s = (t or "").strip()
+    if not s or s.upper() == "NO TIME":
         return None
+    # Normalizamos separadores raros
+    s = s.replace("’", "'").replace("−", "-")
+    # "1:04.07" or "28.81"
+    m = re.match(r"^(\d+):(\d+(?:\.\d+)?)$", s)
+    if m:
+        mm = int(m.group(1))
+        ss = float(m.group(2))
+        return mm * 60.0 + ss
+    # "27.59"
+    m2 = re.match(r"^(\d+(?:\.\d+)?)$", s)
+    if m2:
+        return float(m2.group(1))
+    return None
 
-def map_stroke_usms_to_es(stroke_raw: str) -> str:
-    r = (stroke_raw or "").strip().upper()
-    if "FREE" in r:
-        return "Libre"
-    if "BACK" in r:
-        return "Espalda"
-    if "BREAST" in r:
-        return "Pecho"
-    if "FLY" in r:
-        return "Mariposa"
-    # USMS uses 200 IM / 400 IM
-    if r.endswith("IM") or " IM" in r:
-        return "Combinado"
-    return "Unknown"
-
-def parse_event(event: str) -> Optional[Tuple[int, str]]:
+def parse_pdf_bytes(pdf_bytes: bytes, course: str) -> list[dict]:
     """
-    USMS events look like: '50 Free', '100 Back', '400 IM', '1500 Free'
-    Returns (distance_m, estilo_es)
+    Extrae filas de NQT desde el PDF.
     """
-    if not event:
-        return None
-    event = str(event).replace("\n", " ").strip()
-    m = re.match(r"^\s*(\d+)\s+(.*)\s*$", event)
-    if not m:
-        return None
-    dist = int(m.group(1))
-    stroke_part = m.group(2).strip()
-    estilo = map_stroke_usms_to_es(stroke_part)
-    return dist, estilo
+    text = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages:
+            # extraer texto plano (suficiente: el PDF es tabular simple)
+            text += (p.extract_text() or "") + "\n"
 
-@dataclass
-class SectionInfo:
-    season_year: str
-    course: str  # SCY / LCM
-    gender: str  # M / F
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return []
 
-def iter_sections_with_tables(html: str) -> List[Tuple[SectionInfo, str]]:
-    """
-    Find H3 sections like:
-      '2026 USMS Spring Nationals (SCY) NQTs - Women'
-      '2025 USMS Summer Nationals (LCM) NQTs - Men'
-    and return the adjacent table HTML.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    out: List[Tuple[SectionInfo, str]] = []
+    rows: list[dict] = []
+    gender: str | None = None
 
-    for h3 in soup.find_all(["h3", "h2"]):
-        title = h3.get_text(" ", strip=True)
-        m = re.search(r"(\d{4}).*\((SCY|LCM)\).*-\s*(Women|Men)\s*$", title, re.IGNORECASE)
-        if not m:
+    for ln in lines:
+        up = ln.upper().strip()
+
+        if up == "WOMEN":
+            gender = "F"
             continue
-        season_year = m.group(1)
-        course = m.group(2).upper()
-        gender = "F" if m.group(3).lower() == "women" else "M"
-
-        # find next <table>
-        table = h3.find_next("table")
-        if not table:
+        if up == "MEN":
+            gender = "M"
             continue
-        out.append((SectionInfo(season_year=season_year, course=course, gender=gender), str(table)))
-    return out
 
-def parse_table_to_rows(info: SectionInfo, table_html: str) -> List[Dict]:
-    """
-    Convert an NQT table to standards_usa rows.
-    Table shape: rows=events, columns=age groups.
-    """
-    rows: List[Dict] = []
-    # pandas parses html table → DataFrame
-    dfs = pd.read_html(table_html)
-    if not dfs:
-        return rows
-    df = dfs[0].copy()
-
-    # Normalize column names
-    # Typically first column is "Event"
-    cols = [str(c).strip() for c in df.columns]
-    df.columns = cols
-
-    # Ensure first col is Event-like
-    event_col = cols[0]
-    age_cols = cols[1:]
-
-    for _, r in df.iterrows():
-        event_val = r.get(event_col)
-        parsed = parse_event(event_val)
-        if not parsed:
+        # Saltar headers de tabla
+        if up.startswith("EVENT "):
             continue
-        distancia, estilo = parsed
-        for age in age_cols:
-            age_range = str(age).strip().replace("\n", "").replace(" ", "")
-            time_val = r.get(age)
-            t_seg = clean_time(time_val)
-            if t_seg is None:
+        if up.startswith("USMS NATIONAL QUALIFYING TIMES"):
+            continue
+        if up.startswith("FORMULA:") or up.startswith("NOTE:"):
+            continue
+
+        # Lineas de eventos: "50 Free 28.81 28.18 ... 53.25"
+        m = re.match(r"^(\d+)\s+([A-Za-z]+)\s+(.*)$", ln)
+        if not m or not gender:
+            continue
+
+        dist = int(m.group(1))
+        style_word = m.group(2).strip().upper()
+        tail = m.group(3).strip()
+
+        style = STYLE_MAP.get(style_word, None)
+        if not style:
+            # por si viene "FRE" o algo raro:
+            if style_word.startswith("FRE"):
+                style = "FREE"
+            else:
                 continue
 
+        # tokens de tiempos (con manejo de "NO TIME")
+        toks = tail.split()
+        collapsed: list[str] = []
+        i = 0
+        while i < len(toks):
+            if i + 1 < len(toks) and toks[i].upper() == "NO" and toks[i + 1].upper() == "TIME":
+                collapsed.append("NO TIME")
+                i += 2
+                continue
+            collapsed.append(toks[i])
+            i += 1
+
+        # En algunos PDFs puede aparecer una nota al final; intentamos quedarnos solo con la cantidad correcta
+        if len(collapsed) < len(AGE_COLS):
+            # No hay suficientes columnas -> descartamos
+            continue
+        if len(collapsed) > len(AGE_COLS):
+            collapsed = collapsed[:len(AGE_COLS)]
+
+        for age_label, t in zip(AGE_COLS, collapsed):
+            secs = time_to_seconds(t)
+            if secs is None:
+                continue
             rows.append({
-                "ciclo": info.season_year,
-                "season_year": info.season_year,
-                "standard_type": "MASTERS",
-                "nivel": "NQT",
-                "genero": info.gender,
-                "edad": age_range,          # e.g. 40-44
-                "estilo": estilo,           # Libre/Espalda/...
-                "distancia_m": distancia,   # keep same numeric (yards/meters handled by course)
-                "curso": info.course,       # SCY or LCM
-                "tiempo_s": t_seg,
+                "genero": gender,
+                "edad": age_label,
+                "estilo": style,
+                "distancia_m": dist,
+                "tiempo_s": secs,
+                "curso": course,
             })
+
     return rows
 
-# ----------------------------
-# PDF fallback (kept from v4)
-# ----------------------------
-def extraer_tiempo_testigo(table) -> float:
+def fetch_pdf(url: str) -> bytes:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def derive_season_year_from_url(url: str) -> str:
+    # intenta detectar 4 dígitos del path (ej: .../2026%20spring%20nationals/...)
+    m = re.search(r"(20\d{2})", url)
+    return m.group(1) if m else ""
+
+def chunked(seq, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
+def upsert_rows_to_supabase(sb, rows: list[dict], season_year: str) -> tuple[int,int]:
     """
-    Used only for PDF gender inference (legacy). Returns a time for '50 Free' @ 18-24
+    Inserta (y normaliza) en standards_usa con standard_type=MASTERS y nivel=NQT.
+    Devuelve (inserted, deleted)
     """
+    if not rows:
+        return (0, 0)
+
+    # pre-delete por (season_year, curso) para evitar acumulación
+    deleted = 0
+    by_course = {}
+    for r in rows:
+        by_course.setdefault(r["curso"], 0)
+        by_course[r["curso"]] += 1
+
+    for course in sorted(by_course.keys()):
+        try:
+            # delete solo del conjunto MASTERS + NQT para ese año/curso
+            resp = (
+                sb.table("standards_usa")
+                .delete()
+                .match({"standard_type": "MASTERS", "season_year": season_year, "curso": course, "nivel": "NQT"})
+                .execute()
+            )
+            # supabase-py: resp.data puede venir con filas borradas
+            if getattr(resp, "data", None):
+                deleted += len(resp.data)
+        except Exception as e:
+            print(f"⚠️ Delete pre-run failed for {season_year} {course}: {e}")
+
+    payload = []
+    for r in rows:
+        payload.append({
+            "standard_type": "MASTERS",
+            "season_year": season_year,
+            "genero": r["genero"],
+            "edad": r["edad"],
+            "estilo": r["estilo"],
+            "distancia_m": int(r["distancia_m"]),
+            "nivel": "NQT",
+            "tiempo_s": float(r["tiempo_s"]),
+            "curso": r["curso"],
+        })
+
+    inserted = 0
+    for batch in chunked(payload, 500):
+        sb.table("standards_usa").insert(batch).execute()
+        inserted += len(batch)
+        print(f"   💉 Insert batch: +{len(batch)} (total={inserted})")
+
+    return (inserted, deleted)
+
+def run():
+    load_dotenv()
+
+    sb_url = _env("SUPABASE_URL")
+    sb_key = _env("SUPABASE_KEY")
+    if not sb_url or not sb_key:
+        raise RuntimeError("Missing SUPABASE_URL / SUPABASE_KEY")
+
+    supabase = create_client(sb_url, sb_key)
+
+    scy_url = _env("USMS_SCY_PDF_URL", DEFAULT_SCY_PDF_URL)
+    lcm_url = _env("USMS_LCM_PDF_URL", DEFAULT_LCM_PDF_URL)
+
+    print(f"\n🦈 USMS Masters NQT Scraper v{VERSION} (PDF-first, SCY + LCM)")
+    print(f"   SCY PDF: {scy_url}")
+    print(f"   LCM PDF: {lcm_url}\n")
+
+    stats = {
+        "extracted": 0,
+        "inserted": 0,
+        "deleted": 0,
+        "errors": 0,
+        "scy_rows": 0,
+        "lcm_rows": 0,
+    }
+
+    log_lines = []
+    started = datetime.datetime.utcnow().isoformat() + "Z"
+    log_lines.append(f"Started: {started}")
+
+    # --- SCY
     try:
-        header_idx = -1
-        for i, row in enumerate(table):
-            row_str = " ".join([str(c) for c in row if c])
-            if "18-24" in row_str:
-                header_idx = i
-                break
-        if header_idx == -1:
-            return 9999.0
-
-        for row in table[header_idx+1:]:
-            row_clean = [str(c).replace("\n", " ").strip().upper() for c in row if c]
-            if not row_clean:
-                continue
-            evt = row_clean[0]
-            if "50" in evt and "FREE" in evt:
-                time_val = row[1]
-                t_seg = clean_time(time_val)
-                if t_seg:
-                    return t_seg
-    except Exception:
-        pass
-    return 9999.0
-
-def procesar_tablas_pdf(pdf_bytes: bytes, curso: str, season_year: str) -> List[Dict]:
-    """
-    Legacy PDF extractor (kept). Infers gender by comparing 50 Free 18-24.
-    """
-    data_to_insert: List[Dict] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            if not tables:
-                continue
-
-            mapa_generos: Dict[int, str] = {}
-
-            if len(tables) >= 2:
-                t0 = extraer_tiempo_testigo(tables[0])
-                t1 = extraer_tiempo_testigo(tables[1])
-                if 0 < t0 < t1:
-                    mapa_generos[0], mapa_generos[1] = "M", "F"
-                elif 0 < t1 < t0:
-                    mapa_generos[0], mapa_generos[1] = "F", "M"
-                else:
-                    mapa_generos[0], mapa_generos[1] = "F", "M"
-            else:
-                page_text = (page.extract_text() or "").upper()
-                if "WOMEN" in page_text and "MEN" not in page_text:
-                    mapa_generos[0] = "F"
-                elif "MEN" in page_text and "WOMEN" not in page_text:
-                    mapa_generos[0] = "M"
-                else:
-                    mapa_generos[0] = "F"
-
-            for i, table in enumerate(tables):
-                genero = mapa_generos.get(i, "X")
-
-                header_idx = -1
-                age_groups = []
-                for idx_row, row in enumerate(table):
-                    row_str = " ".join([str(c) for c in row if c])
-                    if "18-24" in row_str:
-                        header_idx = idx_row
-                        age_groups = row
-                        break
-                if header_idx == -1:
-                    continue
-
-                for row in table[header_idx+1:]:
-                    row = [col if col else "" for col in row]
-                    if len(row) < 2:
-                        continue
-
-                    event_name = str(row[0]).replace("\n", " ").strip()
-                    if not event_name or "RELAY" in event_name.upper():
-                        continue
-
-                    parsed = parse_event(event_name)
-                    if not parsed:
-                        continue
-                    distancia, estilo = parsed
-
-                    for col_idx, time_val in enumerate(row):
-                        if col_idx == 0:
-                            continue
-                        if col_idx >= len(age_groups):
-                            break
-                        age_range = str(age_groups[col_idx]).replace("\n", "").strip().replace(" ", "")
-                        t_seg = clean_time(time_val)
-                        if t_seg is None:
-                            continue
-
-                        data_to_insert.append({
-                            "ciclo": season_year,
-                            "season_year": season_year,
-                            "standard_type": "MASTERS",
-                            "nivel": "NQT",
-                            "genero": genero,
-                            "edad": age_range,
-                            "estilo": estilo,
-                            "distancia_m": distancia,
-                            "curso": curso,
-                            "tiempo_s": t_seg,
-                        })
-    return data_to_insert
-
-# ----------------------------
-# Supabase write
-# ----------------------------
-def delete_existing_for(season_year: str, curso: str) -> None:
-    # delete only NQT Masters for that season+course
-    supabase.table("standards_usa") \
-        .delete() \
-        .eq("standard_type", "MASTERS") \
-        .eq("nivel", "NQT") \
-        .eq("season_year", season_year) \
-        .eq("curso", curso) \
-        .execute()
-
-def insert_batches(rows: List[Dict], batch_size: int = 500) -> None:
-    total = len(rows)
-    for i in range(0, total, batch_size):
-        batch = rows[i:i+batch_size]
-        supabase.table("standards_usa").insert(batch).execute()
-        print(f"   💉 Insert lote {i} a {min(i+batch_size, total)}")
-
-# ----------------------------
-# Main
-# ----------------------------
-def ejecutar_cazador() -> None:
-    print("🦈 USMS Masters NQT Scraper v5.0 (SCY + LCM)")
-
-    all_rows: List[Dict] = []
-    try:
-        r = requests.get(USMS_NQT_URL, timeout=30)
-        r.raise_for_status()
-        sections = iter_sections_with_tables(r.text)
-
-        if not sections:
-            raise RuntimeError("No sections/tables found on USMS NQT page (structure changed?)")
-
-        for info, table_html in sections:
-            rows = parse_table_to_rows(info, table_html)
-            if not rows:
-                continue
-            all_rows.extend(rows)
-
-            # stats
-            STATS["courses"][info.course] = STATS["courses"].get(info.course, 0) + len(rows)
-            STATS["seasons"][info.season_year] = STATS["seasons"].get(info.season_year, 0) + len(rows)
-            for x in rows:
-                if x["genero"] == "M":
-                    STATS["male"] += 1
-                elif x["genero"] == "F":
-                    STATS["female"] += 1
-            STATS["extracted"] += len(rows)
-
-        if not all_rows:
-            raise RuntimeError("Parsed 0 rows from USMS NQT page")
-
-        # Delete+Insert per (season_year, curso) to avoid wiping everything
-        keys = sorted({(x["season_year"], x["curso"]) for x in all_rows})
-        print(f"   🔑 Refresh keys: {keys}")
-        for season_year, curso in keys:
-            delete_existing_for(season_year, curso)
-            subset = [x for x in all_rows if x["season_year"] == season_year and x["curso"] == curso]
-            insert_batches(subset, batch_size=500)
-
-        STATS["inserted"] = len(all_rows)
-
-        log_final = (
-            f"[USMS_MASTERS_NQT] Extracted={STATS['extracted']} Inserted={STATS['inserted']} "
-            f"Male={STATS['male']} Female={STATS['female']} "
-            f"Courses={STATS['courses']} Seasons={STATS['seasons']}"
-        )
-        print("\n" + log_final)
-        enviar_reporte_email(log_final, "SUCCESS")
-        return
-
+        scy_bytes = fetch_pdf(scy_url)
+        scy_rows = parse_pdf_bytes(scy_bytes, "SCY")
+        stats["scy_rows"] = len(scy_rows)
+        stats["extracted"] += len(scy_rows)
+        scy_year = derive_season_year_from_url(scy_url)
+        if not scy_year:
+            scy_year = str(datetime.datetime.utcnow().year)
+        ins, dele = upsert_rows_to_supabase(supabase, scy_rows, scy_year)
+        stats["inserted"] += ins
+        stats["deleted"] += dele
+        log_lines.append(f"SCY: year={scy_year} extracted={len(scy_rows)} inserted={ins} deleted={dele}")
     except Exception as e:
-        print(f"⚠️  HTML scrape failed: {e}")
-        STATS["errors"] += 1
+        stats["errors"] += 1
+        log_lines.append(f"SCY: ERROR {e}")
+        print(f"⚠️ SCY failed: {e}")
 
-    # Optional PDF fallback if URLs are provided
+    # --- LCM
     try:
-        fallback_rows: List[Dict] = []
-        if PDF_URL_SCY:
-            rr = requests.get(PDF_URL_SCY, timeout=30)
-            rr.raise_for_status()
-            # try to infer season year from URL; fallback current year
-            y = re.search(r"(20\d{2})", PDF_URL_SCY)
-            season_year = y.group(1) if y else str(datetime.datetime.now().year)
-            fallback_rows.extend(procesar_tablas_pdf(rr.content, "SCY", season_year))
-        if PDF_URL_LCM:
-            rr = requests.get(PDF_URL_LCM, timeout=30)
-            rr.raise_for_status()
-            y = re.search(r"(20\d{2})", PDF_URL_LCM)
-            season_year = y.group(1) if y else str(datetime.datetime.now().year)
-            fallback_rows.extend(procesar_tablas_pdf(rr.content, "LCM", season_year))
-
-        if not fallback_rows:
-            raise RuntimeError("No PDF fallback URLs configured or 0 rows extracted")
-
-        keys = sorted({(x["season_year"], x["curso"]) for x in fallback_rows})
-        print(f"   🔑 Refresh keys (PDF): {keys}")
-        for season_year, curso in keys:
-            delete_existing_for(season_year, curso)
-            subset = [x for x in fallback_rows if x["season_year"] == season_year and x["curso"] == curso]
-            insert_batches(subset, batch_size=500)
-
-        log_final = f"[USMS_MASTERS_NQT_PDF] Inserted={len(fallback_rows)} keys={keys}"
-        print("\n" + log_final)
-        enviar_reporte_email(log_final, "SUCCESS")
-        return
-
+        lcm_bytes = fetch_pdf(lcm_url)
+        lcm_rows = parse_pdf_bytes(lcm_bytes, "LCM")
+        stats["lcm_rows"] = len(lcm_rows)
+        stats["extracted"] += len(lcm_rows)
+        lcm_year = derive_season_year_from_url(lcm_url)
+        if not lcm_year:
+            lcm_year = str(datetime.datetime.utcnow().year)
+        ins, dele = upsert_rows_to_supabase(supabase, lcm_rows, lcm_year)
+        stats["inserted"] += ins
+        stats["deleted"] += dele
+        log_lines.append(f"LCM: year={lcm_year} extracted={len(lcm_rows)} inserted={ins} deleted={dele}")
     except Exception as e:
-        STATS["errors"] += 1
-        msg = f"FAILURE: {e}"
-        print(msg)
-        enviar_reporte_email(msg, "FAILURE")
+        stats["errors"] += 1
+        log_lines.append(f"LCM: ERROR {e}")
+        print(f"⚠️ LCM failed: {e}")
 
+    finished = datetime.datetime.utcnow().isoformat() + "Z"
+    log_lines.append(f"Finished: {finished}")
+    log_lines.append(f"STATS: {stats}")
+
+    ok = stats["inserted"] > 0 and stats["errors"] == 0
+    status = "SUCCESS" if ok else ("PARTIAL" if stats["inserted"] > 0 else "FAILURE")
+
+    summary = (
+        f"[USMS_MASTERS_NQT v{VERSION}] {status} | "
+        f"Inserted={stats['inserted']} Deleted={stats['deleted']} Extracted={stats['extracted']} "
+        f"(SCY={stats['scy_rows']}, LCM={stats['lcm_rows']}) Errors={stats['errors']}"
+    )
+    print("\n" + summary + "\n")
+
+    send_report_email("Run summary", "\n".join(log_lines) + "\n\n" + summary, status)
+
+    if not ok:
+        # exit non-zero si no insertó nada (para que el workflow falle visible)
+        if stats["inserted"] == 0:
+            sys.exit(1)
 
 if __name__ == "__main__":
-    ejecutar_cazador()
+    run()
