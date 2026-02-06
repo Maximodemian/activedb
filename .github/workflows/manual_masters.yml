@@ -2,6 +2,7 @@ name: Actualizar Masters USA (Manual)
 
 on:
   schedule:
+    # A las 09:00 UTC el día 1 de cada mes
     - cron: '0 9 1 * *'
   workflow_dispatch:
 
@@ -15,24 +16,20 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      # Needed because USMS blocks python-requests in CI and we fall back to Playwright.
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
-      - name: Run Masters Scrape
+      - name: Run Masters Scrape (PDF-first)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           MAIL_USERNAME: ${{ secrets.EMAIL_USER }}
           MAIL_PASSWORD: ${{ secrets.EMAIL_PASS }}
-          # Optional, but recommended:
-          FETCH_MODE: auto
-          # If you want PDF fallback, set these repo secrets too:
-          # PDF_URL_SCY: ${{ secrets.USMS_PDF_URL_SCY }}
-          # PDF_URL_LCM: ${{ secrets.USMS_PDF_URL_LCM }}
+          # Fuerza modo PDF (evita 403 del HTML desde GitHub Actions)
+          FETCH_MODE: pdf
+          # Overrides (pueden dejarse así o mover a secrets si querés)
+          USMS_SCY_PDF_URL: https://www-usms-hhgdctfafngha6hr.z01.azurefd.net/-/media/usms/pdfs/pool%20national%20championships/2026%20spring%20nationals/2026%20usms%20spring%20nationals%20nqts.pdf
+          USMS_LCM_PDF_URL: https://www-usms-hhgdctfafngha6hr.z01.azurefd.net/-/media/usms/pdfs/pool%20national%20championships/2025%20summer%20nationals/2025%20usms%20summer%20nationals%20nqts%20v1.pdf
         run: python update_masters.py
